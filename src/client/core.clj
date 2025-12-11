@@ -1,4 +1,4 @@
-(ns client.core
+(ns me-client.core
   "REPL-friendly trading API for matching engine.
    
    Quick Start:
@@ -16,9 +16,9 @@
    Transport:
      (start!)                           ; TCP (default)
      (start! {:transport :udp})         ; UDP"
-  (:require [client.client :as client]
-            [client.protocol :as proto]
-            [client.scenarios :as scenarios]))
+  (:require [me-client.client :as client]
+            [me-client.protocol :as proto]
+            [me-client.scenarios :as scenarios]))
 
 ;; =============================================================================
 ;; State
@@ -379,5 +379,27 @@ Examples:
 "))
 
 ;; Print welcome on load
-(println "\n=== Matching Engine Client ===")
-(println "Type (help) for commands, (start!) to connect.\n")
+(println "
+╔════════════════════════════════════════════════════════════╗
+║           Clojure Matching Engine Client                   ║
+╠════════════════════════════════════════════════════════════╣
+║  (start!)                 Connect to localhost:1234        ║
+║  (start! 9000)            Connect to different port        ║
+║  (start! \"host\" 1234)     Connect to remote host           ║
+╠════════════════════════════════════════════════════════════╣
+║  (buy \"IBM\" 100.50 100)   Buy 100 shares @ $100.50         ║
+║  (sell \"IBM\" 100.50 100)  Sell 100 shares @ $100.50        ║
+║  (cancel \"IBM\" 1)         Cancel order #1                  ║
+║  (flush!)                 Clear all order books            ║
+╠════════════════════════════════════════════════════════════╣
+║  (scenario)               List all test scenarios          ║
+║  (scenario 2)             Run matching trade test          ║
+║  (scenario 20)            Run 1K stress test               ║
+║  (scenario 22)            Run 100K stress test             ║
+╠════════════════════════════════════════════════════════════╣
+║  (show)                   Show recent messages             ║
+║  (status)                 Show connection status           ║
+║  (stop!)                  Disconnect                       ║
+║  (help)                   Show all commands                ║
+╚════════════════════════════════════════════════════════════╝
+")
