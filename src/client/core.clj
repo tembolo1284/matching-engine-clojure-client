@@ -1,4 +1,4 @@
-(ns me-client.core
+(ns client.core
   "REPL-friendly trading API for matching engine.
    
    Quick Start:
@@ -16,9 +16,9 @@
    Transport:
      (start!)                           ; TCP (default)
      (start! {:transport :udp})         ; UDP"
-  (:require [me-client.client :as client]
-            [me-client.protocol :as proto]
-            [me-client.scenarios :as scenarios]))
+  (:require [client.client :as client]
+            [client.protocol :as proto]
+            [client.scenarios :as scenarios]))
 
 ;; =============================================================================
 ;; State
