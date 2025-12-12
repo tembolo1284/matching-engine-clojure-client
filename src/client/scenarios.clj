@@ -469,9 +469,9 @@
                              (stats-total running-stats)))))
         
         (when (and (pos? i) (zero? (mod i pairs-per-batch)))
-          (let [drain-target (* pairs-per-batch 10)]
+          (let [drain-target (* pairs-per-batch 5)]
             (dotimes [_ drain-target]
-              (when-let [msg (client/recv-message conn 10)]
+              (when-let [msg (client/recv-message conn 2)]
                 (count-message! running-stats msg))))
           (Thread/sleep delay-ms)))
       
