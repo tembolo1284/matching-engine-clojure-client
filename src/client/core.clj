@@ -404,3 +404,45 @@ Examples:
 ║  (help)                   Show all commands                ║
 ╚════════════════════════════════════════════════════════════╝
 ")
+
+;; =============================================================================
+;; Market Data Listener
+;; =============================================================================
+
+(defonce ^:private mcast-state (atom {:conn nil :running false}))
+
+(defn start-market-data!
+  "Start listening to multicast market data feed.
+   
+   Examples:
+     (start-market-data!)                    ; Default 239.255.1.1:1236
+     (start-market-data! \"239.255.1.1\" 1236)"
+  ([] (start-market-data! "239.255.1.1" 1236))
+  ([group port]
+   (when (:running @mcast-state)
+     (println "Already listening. Call (stop-market-data!) first.")
+     (return))
+   
+   (let [conn (client/multicast-connect group port)]
+     (swap! mcast-state assoc :conn conn :running true)
+     (println (format "Joined multicast group %s:%d" group port))
+     
+     ;; Start listener thread
+     (future
+       (while (:running @mcast-state)
+         (when-let [msg (client/multicast-recv conn)]
+           (when (not= (:type msg) :error)
+             (println (str "  [MCAST] " (proto/format-message msg))))))
+       (println "Market data listener stopped"))
+     
+     :listening)))
+
+(defn stop-market-data!
+  "Stop listening to multicast market data."
+  []
+  (swap! mcast-state assoc :running false)
+  (when-let [conn (:conn @mcast-state)]
+    (client/multicast-disconnect conn)
+    (swap! mcast-state assoc :conn nil))
+  (println "Stopped market data listener")
+  :stopped)
