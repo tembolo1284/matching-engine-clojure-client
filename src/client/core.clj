@@ -419,23 +419,24 @@ Examples:
      (start-market-data! \"239.255.1.1\" 1236)"
   ([] (start-market-data! "239.255.1.1" 1236))
   ([group port]
-   (when (:running @mcast-state)
-     (println "Already listening. Call (stop-market-data!) first.")
-     (return))
-   
-   (let [conn (client/multicast-connect group port)]
-     (swap! mcast-state assoc :conn conn :running true)
-     (println (format "Joined multicast group %s:%d" group port))
+   (if (:running @mcast-state)
+     (do
+       (println "Already listening. Call (stop-market-data!) first.")
+       :already-running)
      
-     ;; Start listener thread
-     (future
-       (while (:running @mcast-state)
-         (when-let [msg (client/multicast-recv conn)]
-           (when (not= (:type msg) :error)
-             (println (str "  [MCAST] " (proto/format-message msg))))))
-       (println "Market data listener stopped"))
-     
-     :listening)))
+     (let [conn (client/multicast-connect group port)]
+       (swap! mcast-state assoc :conn conn :running true)
+       (println (format "Joined multicast group %s:%d" group port))
+       
+       ;; Start listener thread
+       (future
+         (while (:running @mcast-state)
+           (when-let [msg (client/multicast-recv conn)]
+             (when (not= (:type msg) :error)
+               (println (str "  [MCAST] " (proto/format-message msg))))))
+         (println "Market data listener stopped"))
+       
+       :listening))))
 
 (defn stop-market-data!
   "Stop listening to multicast market data."
