@@ -141,15 +141,14 @@
    (buy symbol price qty (next-order-id!)))
   ([symbol price qty order-id]
    (let [conn (:conn @state)
-         user-id (:user-id @state)
-         price-cents (int (* price 100))]
+         user-id (:user-id @state)]
      (when-not conn
        (throw (ex-info "Not connected. Call (start!) first." {})))
-     (println (format "→ BUY %s %s qty=%d (order %d)"
-                      symbol (double price) qty order-id))
-     (client/send-order! conn user-id symbol price-cents qty :buy order-id)
+     (println (format "→ BUY %s %.2f qty=%d (order %d)"
+                      symbol (double price) (int qty) order-id))
+     (client/send-order! conn user-id symbol (int price) (int qty) :buy order-id)
      (Thread/sleep 50)
-     (doseq [msg (client/recv-all conn)]
+     (doseq [msg (client/recv-all conn 100)]
        (print-msg msg))
      order-id)))
 
@@ -169,8 +168,7 @@
    (sell symbol price qty (next-order-id!)))
   ([symbol price qty order-id]
    (let [conn (:conn @state)
-         user-id (:user-id @state)
-         price-cents (int (* price 100))]
+         user-id (:user-id @state)]
      (when-not conn
        (throw (ex-info "Not connected. Call (start!) first." {})))
      (println (format "→ SELL %s %s qty=%d (order %d)"
