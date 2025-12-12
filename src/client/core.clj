@@ -44,7 +44,7 @@
                h')))))
 
 (defn- print-msg [msg]
-  (println (str "  " (proto/format-message msg)))
+  (println (str "  [RECV]  " (proto/format-message msg)))
   (add-to-history! msg))
 
 ;; =============================================================================
@@ -146,8 +146,9 @@
      (when-not conn
        (throw (ex-info "Not connected. Call (start!) first." {})))
      (println (format "→ BUY %s %s qty=%d (order %d)"
-                      symbol (proto/format-price price-cents) qty order-id))
+                      symbol (double price) qty order-id))
      (client/send-order! conn user-id symbol price-cents qty :buy order-id)
+     (Thread/sleep 50)
      (doseq [msg (client/recv-all conn)]
        (print-msg msg))
      order-id)))
@@ -173,8 +174,9 @@
      (when-not conn
        (throw (ex-info "Not connected. Call (start!) first." {})))
      (println (format "→ SELL %s %s qty=%d (order %d)"
-                      symbol (proto/format-price price-cents) qty order-id))
+                      symbol (double price) qty order-id))
      (client/send-order! conn user-id symbol price-cents qty :sell order-id)
+     (Thread/sleep 50)
      (doseq [msg (client/recv-all conn)]
        (print-msg msg))
      order-id)))
@@ -195,6 +197,7 @@
       (throw (ex-info "Not connected. Call (start!) first." {})))
     (println (format "→ CANCEL %s order %d" symbol order-id))
     (client/send-cancel! conn user-id symbol order-id)
+    (Thread/sleep 50)
     (doseq [msg (client/recv-all conn)]
       (print-msg msg))
     :cancelled))
