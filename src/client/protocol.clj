@@ -225,22 +225,22 @@
 (defn format-price
   "Format price in cents as dollars string."
   [price]
-  (format "$%.2f" (/ price 100.0)))
+  (format "$%.2f" (double price)))
 
 (defn format-message
   "Format a decoded message for human-readable display."
   [msg]
   (case (:type msg)
     :ack
-    (format "ACK: %s user=%d order=%d"
+    (format "A: %s user=%d order=%d"
             (:symbol msg) (:user-id msg) (:order-id msg))
     
     :cancel-ack
-    (format "CANCEL: %s user=%d order=%d"
+    (format "C: %s user=%d order=%d"
             (:symbol msg) (:user-id msg) (:order-id msg))
     
     :trade
-    (format "TRADE: %s %s qty=%d buy=%d/%d sell=%d/%d"
+    (format "T: %s %s qty=%d buy=%d/%d sell=%d/%d"
             (:symbol msg)
             (format-price (:price msg))
             (:quantity msg)
@@ -249,15 +249,15 @@
     
     :top-of-book
     (if (:eliminated? msg)
-      (format "TOB: %s %s ELIMINATED"
-              (:symbol msg) (name (or (:side msg) :?)))
-      (format "TOB: %s %s %s qty=%d"
+      (format "B: %s %s, -, -"
               (:symbol msg)
-              (name (or (:side msg) :?))
+              (if (:side msg) (if (= (:side msg) :buy) "B" "S") "-"))
+      (format "B: %s %s %s %d"
+              (:symbol msg)
+              (if (= (:side msg) :buy) "B" "S")
               (format-price (:price msg))
               (:quantity msg)))
-    
-    (str msg)))
+      (str msg)))
 
 ;; =============================================================================
 ;; CSV Protocol Encoding (Client → Server)

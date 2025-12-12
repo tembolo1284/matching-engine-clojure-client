@@ -305,7 +305,7 @@
   "Auto-detect server protocol by sending probe messages.
    
    Strategy:
-   1. Send binary probe order
+   1. Send binary cancel for non-existent order
    2. If binary response → :binary
    3. Otherwise → try CSV, or default to :binary
    
@@ -318,17 +318,14 @@
     
     ;; Try binary first
     (try
-      (send-raw! conn (buf->bytes (proto/encode-new-order 
-                                   probe-user probe-symbol 1 1 :buy probe-order)))
-      (Thread/sleep 100)
+      (send-raw! conn (buf->bytes (proto/encode-cancel 
+                                   probe-user probe-symbol probe-order)))
+      (Thread/sleep 50)
       (when-let [response (recv-raw conn 500)]
         (if (proto/binary-message? response)
           (do
             ;; Cancel probe
-            (send-raw! conn (buf->bytes (proto/encode-cancel 
-                                         probe-user probe-symbol probe-order)))
-            (Thread/sleep 50)
-            (recv-all conn 100)
+            (recv-all conn 100) ;; drain any extra responses
             (reset! detected :binary))
           ;; Got non-binary response - might be CSV
           (do
@@ -337,18 +334,15 @@
       (catch Exception _))
     
     (when-not @detected
-      ;; Try CSV
+      ;; Try CSV cancel
       (try
-        (send-raw! conn (proto/csv-encode-new-order 
-                         probe-user probe-symbol 1 1 :buy (inc probe-order)))
-        (Thread/sleep 100)
+        (send-raw! conn (proto/csv-encode-cancel 
+                         probe-user probe-symbol (inc probe-order)))
+        (Thread/sleep 50)
         (when-let [response (recv-raw conn 500)]
           (if (proto/binary-message? response)
             (reset! detected :binary)
             (do
-              (send-raw! conn (proto/csv-encode-cancel 
-                               probe-user probe-symbol (inc probe-order)))
-              (Thread/sleep 50)
               (recv-all conn 100)
               (reset! detected :csv))))
         (catch Exception _)))
