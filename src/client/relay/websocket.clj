@@ -1,276 +1,220 @@
 (ns client.relay.websocket
-  "WebSocket server for broadcasting market data to browser clients.
-   
-   Uses http-kit for async WebSocket handling and optionally
-   serves static files for the ClojureScript UI."
-  (:require [org.httpkit.server :as http]
-            [clojure.java.io :as io]
-            [clojure.string :as str])
-  (:import [java.time Instant]
-           [java.util UUID]))
+  "WebSocket server for browser clients."
+  (:require [clojure.data.json :as json]
+            [clojure.java.io :as io])
+  (:import [java.net ServerSocket Socket]
+           [java.io BufferedReader InputStreamReader OutputStream BufferedInputStream]
+           [java.security MessageDigest]
+           [java.util Base64]
+           [java.util.concurrent ConcurrentHashMap]))
 
 ;; =============================================================================
 ;; State
 ;; =============================================================================
 
-(defonce ^:private server (atom nil))
-(defonce ^:private clients (atom {}))  ; {channel-id {:channel ch :connected-at inst :metadata {}}}
+(defonce ^:private clients (ConcurrentHashMap.))
+(defonce ^:private server-socket (atom nil))
+(defonce ^:private running (atom false))
 
 ;; =============================================================================
-;; JSON Encoding (minimal, no external deps)
+;; WebSocket Handshake
 ;; =============================================================================
 
-(defn- escape-string [^String s]
-  (-> s
-      (str/replace "\\" "\\\\")
-      (str/replace "\"" "\\\"")
-      (str/replace "\n" "\\n")
-      (str/replace "\r" "\\r")
-      (str/replace "\t" "\\t")))
+(def ^:private ws-magic "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
 
-(defn- to-json
-  "Simple JSON encoder for message maps. Handles our specific data types."
-  [x]
-  (cond
-    (nil? x)     "null"
-    (boolean? x) (str x)
-    (number? x)  (str x)
-    (keyword? x) (str "\"" (name x) "\"")
-    (string? x)  (str "\"" (escape-string x) "\"")
-    (map? x)     (str "{"
-                      (->> x
-                           (map (fn [[k v]]
-                                  (str (to-json (if (keyword? k) (name k) (str k)))
-                                       ":"
-                                       (to-json v))))
-                           (str/join ","))
-                      "}")
-    (coll? x)    (str "["
-                      (->> x (map to-json) (str/join ","))
-                      "]")
-    :else        (str "\"" (escape-string (str x)) "\"")))
+(defn- compute-accept-key [key]
+  (let [digest (MessageDigest/getInstance "SHA-1")
+        hash (.digest digest (.getBytes (str key ws-magic)))]
+    (.encodeToString (Base64/getEncoder) hash)))
+
+(defn- parse-http-request [^BufferedReader reader]
+  (let [request-line (.readLine reader)]
+    (when request-line
+      (loop [headers {}]
+        (let [line (.readLine reader)]
+          (if (or (nil? line) (empty? line))
+            {:request-line request-line :headers headers}
+            (let [[k v] (clojure.string/split line #": " 2)]
+              (recur (assoc headers (clojure.string/lower-case k) v)))))))))
+
+(defn- send-handshake-response [^OutputStream out accept-key]
+  (let [response (str "HTTP/1.1 101 Switching Protocols\r\n"
+                      "Upgrade: websocket\r\n"
+                      "Connection: Upgrade\r\n"
+                      "Sec-WebSocket-Accept: " accept-key "\r\n"
+                      "\r\n")]
+    (.write out (.getBytes response))
+    (.flush out)))
 
 ;; =============================================================================
-;; Client Management
+;; WebSocket Framing
 ;; =============================================================================
 
-(defn client-count
-  "Number of connected WebSocket clients."
-  []
-  (count @clients))
+(defn- send-ws-frame [^OutputStream out ^String text]
+  (let [payload (.getBytes text "UTF-8")
+        len (alength payload)]
+    ;; Text frame opcode
+    (.write out 0x81)
+    ;; Length
+    (cond
+      (< len 126)
+      (.write out len)
+      
+      (< len 65536)
+      (do
+        (.write out 126)
+        (.write out (bit-shift-right len 8))
+        (.write out (bit-and len 0xFF)))
+      
+      :else
+      (do
+        (.write out 127)
+        (doseq [i (range 7 -1 -1)]
+          (.write out (bit-and (bit-shift-right len (* i 8)) 0xFF)))))
+    
+    (.write out payload)
+    (.flush out)))
 
-(defn client-info
-  "Get info about all connected clients."
-  []
-  (->> @clients
-       (map (fn [[id {:keys [connected-at metadata]}]]
-              {:id id
-               :connected-at (str connected-at)
-               :metadata metadata}))
-       vec))
-
-(defn- add-client! [ch]
-  (let [id (str (UUID/randomUUID))]
-    (swap! clients assoc id {:channel ch
-                             :connected-at (Instant/now)
-                             :metadata {}})
-    id))
-
-(defn- remove-client! [ch]
-  (swap! clients (fn [m]
-                   (->> m
-                        (remove (fn [[_ v]] (= (:channel v) ch)))
-                        (into {})))))
-
-(defn- get-channels []
-  (->> @clients vals (map :channel)))
-
-;; =============================================================================
-;; Broadcasting
-;; =============================================================================
-
-(defn broadcast!
-  "Broadcast a message to all connected WebSocket clients.
-   Message is converted to JSON before sending."
-  [msg]
-  (let [json (to-json msg)
-        channels (get-channels)]
-    (doseq [ch channels]
-      (try
-        (http/send! ch json)
-        (catch Exception _
-          (remove-client! ch))))))
-
-(defn send-to-client!
-  "Send a message to a specific client by ID."
-  [client-id msg]
-  (when-let [client (get @clients client-id)]
-    (try
-      (http/send! (:channel client) (to-json msg))
-      true
-      (catch Exception _
-        (remove-client! (:channel client))
-        false))))
+(defn- read-ws-frame [^BufferedInputStream in]
+  (let [b1 (.read in)]
+    (when (not= b1 -1)
+      (let [_fin (bit-and b1 0x80)
+            opcode (bit-and b1 0x0F)
+            b2 (.read in)
+            masked (pos? (bit-and b2 0x80))
+            len1 (bit-and b2 0x7F)
+            len (cond
+                  (< len1 126) len1
+                  (= len1 126) (+ (bit-shift-left (.read in) 8) (.read in))
+                  :else (reduce (fn [acc _] (+ (bit-shift-left acc 8) (.read in))) 0 (range 8)))
+            mask (when masked
+                   (byte-array [(.read in) (.read in) (.read in) (.read in)]))
+            payload (byte-array len)]
+        (when (pos? len)
+          (.read in payload))
+        (when masked
+          (dotimes [i len]
+            (aset-byte payload i (byte (bit-xor (aget payload i) (aget ^bytes mask (mod i 4)))))))
+        {:opcode opcode
+         :payload (String. payload "UTF-8")}))))
 
 ;; =============================================================================
 ;; Static File Serving
 ;; =============================================================================
 
-(def ^:private content-types
-  {"html" "text/html; charset=utf-8"
-   "css"  "text/css; charset=utf-8"
-   "js"   "application/javascript; charset=utf-8"
-   "json" "application/json; charset=utf-8"
-   "svg"  "image/svg+xml"
-   "png"  "image/png"
-   "ico"  "image/x-icon"
-   "woff" "font/woff"
-   "woff2" "font/woff2"})
+(defn- content-type [path]
+  (cond
+    (clojure.string/ends-with? path ".html") "text/html"
+    (clojure.string/ends-with? path ".css") "text/css"
+    (clojure.string/ends-with? path ".js") "application/javascript"
+    (clojure.string/ends-with? path ".json") "application/json"
+    (clojure.string/ends-with? path ".png") "image/png"
+    (clojure.string/ends-with? path ".ico") "image/x-icon"
+    :else "text/plain"))
 
-(defn- get-content-type [path]
-  (let [ext (last (str/split path #"\."))]
-    (get content-types ext "application/octet-stream")))
-
-(defn- serve-static [path]
-  (let [path (if (= path "/") "/index.html" path)
-        resource-path (str "public" path)
-        resource (io/resource resource-path)]
+(defn- serve-static [^OutputStream out path]
+  (let [resource-path (if (= path "/") "/index.html" path)
+        resource (io/resource (str "public" resource-path))]
     (if resource
-      {:status 200
-       :headers {"Content-Type" (get-content-type path)
-                 "Cache-Control" "public, max-age=3600"}
-       :body (io/input-stream resource)}
-      {:status 404
-       :headers {"Content-Type" "text/plain"}
-       :body "Not Found"})))
+      (let [content (slurp resource)
+            response (str "HTTP/1.1 200 OK\r\n"
+                          "Content-Type: " (content-type resource-path) "\r\n"
+                          "Content-Length: " (count (.getBytes content "UTF-8")) "\r\n"
+                          "\r\n"
+                          content)]
+        (.write out (.getBytes response "UTF-8")))
+      (let [response "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nNot Found"]
+        (.write out (.getBytes response))))
+    (.flush out)))
 
 ;; =============================================================================
-;; WebSocket Handler
+;; Client Handling
 ;; =============================================================================
 
-(defn- ws-handler
-  "Handle WebSocket connections."
-  [on-connect on-message on-disconnect]
-  (fn [req]
-    (http/with-channel req ch
-      (if (http/websocket? ch)
-        (let [client-id (add-client! ch)]
-          (when on-connect
-            (on-connect client-id))
-          
-          (http/on-receive ch
-            (fn [data]
-              (when on-message
-                (on-message client-id data))))
-          
-          (http/on-close ch
-            (fn [status]
-              (remove-client! ch)
-              (when on-disconnect
-                (on-disconnect client-id status)))))
-        
-        ;; Not a WebSocket request - return 400
-        {:status 400
-         :headers {"Content-Type" "text/plain"}
-         :body "Expected WebSocket connection"}))))
+(defn- handle-client [^Socket socket]
+  (let [client-id (str (java.util.UUID/randomUUID))
+        in (BufferedInputStream. (.getInputStream socket))
+        out (.getOutputStream socket)
+        reader (BufferedReader. (InputStreamReader. in))]
+    (try
+      (when-let [{:keys [request-line headers]} (parse-http-request reader)]
+        (let [[_ path] (re-find #"GET ([^ ]+)" request-line)]
+          (if (= path "/ws")
+            ;; WebSocket upgrade
+            (when-let [ws-key (get headers "sec-websocket-key")]
+              (let [accept-key (compute-accept-key ws-key)]
+                (send-handshake-response out accept-key)
+                (.put clients client-id {:socket socket :out out})
+                (println (format "[info] Client connected: %s (total: %d)" 
+                                 client-id (.size clients)))
+                
+                ;; Read loop
+                (loop []
+                  (when-let [{:keys [opcode payload]} (read-ws-frame in)]
+                    (case opcode
+                      8 nil  ; Close
+                      9 (do  ; Ping -> Pong
+                          (send-ws-frame out payload)
+                          (recur))
+                      10 (recur)  ; Pong - ignore
+                      (recur))))))
+            
+            ;; Regular HTTP - serve static
+            (serve-static out path))))
+      
+      (catch Exception e
+        (when-not (or (instance? java.net.SocketException e)
+                      (instance? java.io.EOFException e))
+          (println "[warn] Client error:" (.getMessage e))))
+      
+      (finally
+        (.remove clients client-id)
+        (try (.close socket) (catch Exception _))
+        (println (format "[info] Client disconnected: %s (total: %d)" 
+                         client-id (.size clients)))))))
 
 ;; =============================================================================
-;; HTTP Router
+;; Broadcast
 ;; =============================================================================
 
-(defn- make-handler
-  "Create HTTP handler with WebSocket and optional static file serving."
-  [{:keys [serve-static? on-connect on-message on-disconnect]}]
-  (let [ws (ws-handler on-connect on-message on-disconnect)]
-    (fn [req]
-      (let [path (:uri req)
-            upgrade? (= "websocket" (str/lower-case (get-in req [:headers "upgrade"] "")))]
-        (cond
-          ;; WebSocket endpoint
-          (or upgrade? (= path "/ws"))
-          (ws req)
-          
-          ;; Health check
-          (= path "/health")
-          {:status 200
-           :headers {"Content-Type" "application/json"}
-           :body (to-json {:status "ok"
-                           :clients (client-count)
-                           :uptime-ms (- (System/currentTimeMillis)
-                                        (or (:started-at @server) 0))})}
-          
-          ;; Client list (for debugging)
-          (= path "/clients")
-          {:status 200
-           :headers {"Content-Type" "application/json"}
-           :body (to-json (client-info))}
-          
-          ;; Static files
-          serve-static?
-          (serve-static path)
-          
-          ;; 404
-          :else
-          {:status 404
-           :headers {"Content-Type" "text/plain"}
-           :body "Not Found"})))))
+(defn broadcast!
+  "Send message to all connected WebSocket clients."
+  [msg]
+  (let [json-msg (if (string? msg) msg (json/write-str msg))]
+    (doseq [[client-id {:keys [out]}] clients]
+      (try
+        (send-ws-frame out json-msg)
+        (catch Exception e
+          (println (format "[warn] Failed to send to %s: %s" client-id (.getMessage e)))
+          (.remove clients client-id))))))
 
 ;; =============================================================================
-;; Server Lifecycle
+;; Server
 ;; =============================================================================
 
-(defn start!
-  "Start the WebSocket server.
-   
-   Options:
-     :host          - bind address (default: 0.0.0.0)
-     :port          - listen port (default: 8080)
-     :serve-static? - serve files from resources/public (default: true)
-     :on-connect    - fn called with client-id on connect
-     :on-message    - fn called with [client-id message] on receive
-     :on-disconnect - fn called with [client-id status] on disconnect
-   
-   Returns the server instance."
-  [{:keys [host port serve-static? on-connect on-message on-disconnect]
-    :or {host "0.0.0.0"
-         port 8080
-         serve-static? true}}]
-  (when @server
-    (throw (ex-info "Server already running" {:port port})))
-  
-  (let [handler (make-handler {:serve-static? serve-static?
-                               :on-connect on-connect
-                               :on-message on-message
-                               :on-disconnect on-disconnect})
-        srv (http/run-server handler {:ip host
-                                       :port port
-                                       :thread 4
-                                       :max-body (* 1024 1024)})]
-    (reset! server {:stop-fn srv
-                    :started-at (System/currentTimeMillis)
-                    :host host
-                    :port port})
-    (reset! clients {})
-    @server))
+(defn start! [host port]
+  (reset! running true)
+  (let [ss (ServerSocket. port 50 (java.net.InetAddress/getByName host))]
+    (reset! server-socket ss)
+    (println (format "[info] WebSocket server started on %s:%d" host port))
+    
+    (future
+      (while @running
+        (try
+          (let [client (.accept ss)]
+            (future (handle-client client)))
+          (catch java.net.SocketException _
+            ;; Server closed
+            )
+          (catch Exception e
+            (when @running
+              (println "[error] Accept error:" (.getMessage e)))))))))
 
-(defn stop!
-  "Stop the WebSocket server."
-  []
-  (when-let [{:keys [stop-fn]} @server]
-    (stop-fn :timeout 1000)
-    (reset! server nil)
-    (reset! clients {})))
-
-(defn running?
-  "Check if server is running."
-  []
-  (some? @server))
-
-(defn server-info
-  "Get server status information."
-  []
-  (when @server
-    (merge @server
-           {:clients (client-count)
-            :uptime-ms (- (System/currentTimeMillis)
-                         (:started-at @server))})))
+(defn stop! []
+  (reset! running false)
+  (when-let [ss @server-socket]
+    (try (.close ss) (catch Exception _)))
+  (doseq [[_ {:keys [socket]}] clients]
+    (try (.close ^Socket socket) (catch Exception _)))
+  (.clear clients)
+  (println "[info] WebSocket server stopped"))
