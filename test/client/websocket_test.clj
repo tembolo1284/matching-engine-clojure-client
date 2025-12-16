@@ -1,6 +1,6 @@
-(ns me-client.websocket-test
+(ns client.websocket-test
   (:require [clojure.test :refer [deftest testing is use-fixtures]]
-            [me-client.relay.websocket :as ws])
+            [client.relay.websocket :as ws])
   (:import [java.net URI]
            [org.java_websocket.client WebSocketClient]
            [org.java_websocket.handshake ServerHandshake]))

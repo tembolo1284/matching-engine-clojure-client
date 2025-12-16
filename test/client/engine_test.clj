@@ -1,7 +1,7 @@
-(ns me-client.engine-test
+(ns client.engine-test
   (:require [clojure.test :refer [deftest testing is use-fixtures]]
-            [me-client.relay.engine :as engine]
-            [me-client.protocol :as proto])
+            [client.relay.engine :as engine]
+            [client.protocol :as proto])
   (:import [java.net ServerSocket]
            [java.io BufferedOutputStream]))
 

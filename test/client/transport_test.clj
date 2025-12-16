@@ -1,7 +1,7 @@
-(ns me-client.transport-test
+(ns client.transport-test
   (:require [clojure.test :refer [deftest testing is use-fixtures]]
-            [me-client.transport :as transport]
-            [me-client.protocol :as proto])
+            [client.transport :as transport]
+            [client.protocol :as proto])
   (:import [java.net ServerSocket Socket InetSocketAddress]
            [java.io BufferedInputStream BufferedOutputStream]))
 

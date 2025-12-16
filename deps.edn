@@ -7,12 +7,12 @@
  :aliases
  {;; REPL client for interactive use
   :repl
-  {:main-opts ["-m" "me-client.client.core"]
+  {:main-opts ["-m" "client.core"]
    :extra-paths ["dev"]}
   
   ;; Relay server
   :relay
-  {:main-opts ["-m" "me-client.relay.core"]}
+  {:main-opts ["-m" "client.relay.core"]}
   
   ;; nREPL for editor integration
   :nrepl
@@ -29,17 +29,17 @@
   :build-client
   {:extra-deps {com.github.seancorfield/depstar {:mvn/version "2.1.303"}}
    :exec-fn hf.depstar/uberjar
-   :exec-args {:jar "target/me-client.jar"
+   :exec-args {:jar "target/client.jar"
                :aot true
-               :main-class me_client.client.core}}
+               :main-class client.core}}
   
   ;; Build relay jar
   :build-relay
   {:extra-deps {com.github.seancorfield/depstar {:mvn/version "2.1.303"}}
    :exec-fn hf.depstar/uberjar
-   :exec-args {:jar "target/me-relay.jar"
+   :exec-args {:jar "target/relay.jar"
                :aot true
-               :main-class me_client.relay.core}}
+               :main-class client.relay.core}}
   
   ;; Run tests
   :test

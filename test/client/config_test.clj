@@ -1,6 +1,6 @@
-(ns me-client.config-test
+(ns client.config-test
   (:require [clojure.test :refer [deftest testing is]]
-            [me-client.relay.config :as config]))
+            [client.relay.config :as config]))
 
 ;; =============================================================================
 ;; CLI Parsing Tests

@@ -1,6 +1,6 @@
-(ns me-client.protocol-test
+(ns client.protocol-test
   (:require [clojure.test :refer [deftest testing is are]]
-            [me-client.protocol :as proto])
+            [client.protocol :as proto])
   (:import [java.io ByteArrayInputStream ByteArrayOutputStream]))
 
 ;; =============================================================================
