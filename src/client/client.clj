@@ -305,7 +305,7 @@
   "Auto-detect server protocol by sending probe messages.
    
    Strategy:
-   1. Send binary probe order
+   1. Send binary cancel for non-existent order
    2. If binary response → :binary
    3. Otherwise → try CSV, or default to :binary
    
@@ -318,17 +318,14 @@
     
     ;; Try binary first
     (try
-      (send-raw! conn (buf->bytes (proto/encode-new-order 
-                                   probe-user probe-symbol 1 1 :buy probe-order)))
-      (Thread/sleep 100)
+      (send-raw! conn (buf->bytes (proto/encode-cancel 
+                                   probe-user probe-symbol probe-order)))
+      (Thread/sleep 50)
       (when-let [response (recv-raw conn 500)]
         (if (proto/binary-message? response)
           (do
             ;; Cancel probe
-            (send-raw! conn (buf->bytes (proto/encode-cancel 
-                                         probe-user probe-symbol probe-order)))
-            (Thread/sleep 50)
-            (recv-all conn 100)
+            (recv-all conn 100) ;; drain any extra responses
             (reset! detected :binary))
           ;; Got non-binary response - might be CSV
           (do
@@ -337,18 +334,15 @@
       (catch Exception _))
     
     (when-not @detected
-      ;; Try CSV
+      ;; Try CSV cancel
       (try
-        (send-raw! conn (proto/csv-encode-new-order 
-                         probe-user probe-symbol 1 1 :buy (inc probe-order)))
-        (Thread/sleep 100)
+        (send-raw! conn (proto/csv-encode-cancel 
+                         probe-user probe-symbol (inc probe-order)))
+        (Thread/sleep 50)
         (when-let [response (recv-raw conn 500)]
           (if (proto/binary-message? response)
             (reset! detected :binary)
             (do
-              (send-raw! conn (proto/csv-encode-cancel 
-                               probe-user probe-symbol (inc probe-order)))
-              (Thread/sleep 50)
               (recv-all conn 100)
               (reset! detected :csv))))
         (catch Exception _)))
@@ -395,3 +389,53 @@
        ~@body
        (finally
          (disconnect ~binding)))))
+
+;; =============================================================================
+;; Multicast Listener
+;; =============================================================================
+
+(defn multicast-connect
+  "Join a multicast group to receive market data.
+   
+   Args:
+     group: Multicast group address (default \"239.255.1.1\")
+     port: Multicast port (default 1236)
+   
+   Returns: Connection map with :type :multicast"
+  ([] (multicast-connect "239.255.1.1" 1236))
+  ([group port]
+   (let [socket (java.net.MulticastSocket. port)
+         group-addr (java.net.InetAddress/getByName group)]
+     (.joinGroup socket group-addr)
+     (.setSoTimeout socket 1000)
+     {:type :multicast
+      :socket socket
+      :group-addr group-addr
+      :port port
+      :recv-buf (byte-array 65536)
+      :protocol (atom :binary)})))
+
+(defn multicast-disconnect
+  "Leave multicast group and close socket."
+  [conn]
+  (when-let [socket (:socket conn)]
+    (try
+      (.leaveGroup ^java.net.MulticastSocket socket ^java.net.InetAddress (:group-addr conn))
+      (.close ^java.net.MulticastSocket socket)
+      (catch Exception _))))
+
+(defn multicast-recv
+  "Receive a message from multicast. Returns decoded message or nil on timeout."
+  [conn]
+  (try
+    (let [socket ^java.net.MulticastSocket (:socket conn)
+          buf ^bytes (:recv-buf conn)
+          packet (java.net.DatagramPacket. buf (alength buf))]
+      (.receive socket packet)
+      (let [len (.getLength packet)
+            data (byte-array len)]
+        (System/arraycopy buf 0 data 0 len)
+        (proto/decode-auto data)))
+    (catch java.net.SocketTimeoutException _ nil)
+    (catch Exception e
+      {:type :error :message (.getMessage e)})))

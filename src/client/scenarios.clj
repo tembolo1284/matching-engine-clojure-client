@@ -7,6 +7,7 @@
      (run! conn 2)      ; Matching trade
      (run! conn 20)     ; 1K matching stress
      (list-scenarios)   ; Show available scenarios"
+  (:refer-clojure :exclude [run!])
   (:require [client.client :as client]
             [client.protocol :as proto]))
 
@@ -176,7 +177,8 @@
   (recv-and-print-responses conn)
   (println "\n[FLUSH] Cleaning up server state")
   (client/send-flush! conn)
-  (Thread/sleep 100))
+  (Thread/sleep 100)
+  (recv-and-print-responses conn))
 
 (defn scenario-2
   "Matching Trade - buy and sell at same price"
@@ -190,7 +192,8 @@
   (recv-and-print-responses conn)
   (println "\n[FLUSH] Cleaning up server state")
   (client/send-flush! conn)
-  (Thread/sleep 100))
+  (Thread/sleep 100)
+  (recv-and-print-responses conn))
 
 (defn scenario-3
   "Cancel Order - place then cancel"
@@ -204,7 +207,8 @@
   (recv-and-print-responses conn)
   (println "\n[FLUSH] Cleaning up server state")
   (client/send-flush! conn)
-  (Thread/sleep 100))
+  (Thread/sleep 100)
+  (recv-and-print-responses conn))
 
 ;; =============================================================================
 ;; Unmatched Stress Test
@@ -333,9 +337,9 @@
         
         (when (and (pos? i) (zero? (mod i pairs-per-batch)))
           ;; Drain aggressively
-          (let [drain-target (* pairs-per-batch 10)]
+          (let [drain-target (* pairs-per-batch 5)]
             (dotimes [_ drain-target]
-              (when-let [msg (client/recv-message conn 10)]
+              (when-let [msg (client/recv-message conn 1)]
                 (count-message! running-stats msg))))
           (Thread/sleep delay-ms)))
       
@@ -465,9 +469,9 @@
                              (stats-total running-stats)))))
         
         (when (and (pos? i) (zero? (mod i pairs-per-batch)))
-          (let [drain-target (* pairs-per-batch 10)]
+          (let [drain-target (* pairs-per-batch 5)]
             (dotimes [_ drain-target]
-              (when-let [msg (client/recv-message conn 10)]
+              (when-let [msg (client/recv-message conn 2)]
                 (count-message! running-stats msg))))
           (Thread/sleep delay-ms)))
       
