@@ -1,9 +1,9 @@
-(ns me-client.transport
+(ns client.transport
   "Transport layer for TCP, UDP, and multicast connections.
    
    Provides a unified interface for connecting to the matching engine
    and receiving market data. Used by both REPL client and relay."
-  (:require [me-client.protocol :as proto])
+  (:require [client.protocol :as proto])
   (:import [java.net Socket DatagramSocket DatagramPacket
             InetAddress InetSocketAddress MulticastSocket NetworkInterface]
            [java.io BufferedInputStream BufferedOutputStream]))

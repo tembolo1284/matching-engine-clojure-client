@@ -1,10 +1,10 @@
-(ns me-client.relay.engine
+(ns client.relay.engine
   "Engine connection manager for the relay.
    
    Connects to the matching engine via TCP, UDP, or multicast,
    filters messages by type, and dispatches to registered handlers."
-  (:require [me-client.transport :as transport]
-            [me-client.protocol :as proto]))
+  (:require [client.transport :as transport]
+            [client.protocol :as proto]))
 
 ;; =============================================================================
 ;; State

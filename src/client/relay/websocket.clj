@@ -1,4 +1,4 @@
-(ns me-client.relay.websocket
+(ns client.relay.websocket
   "WebSocket server for broadcasting market data to browser clients.
    
    Uses http-kit for async WebSocket handling and optionally

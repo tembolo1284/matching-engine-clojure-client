@@ -1,4 +1,4 @@
-(ns me-client.protocol
+(ns client.protocol
   "Binary protocol encoder/decoder for matching engine communication.
    
    Wire format (little-endian):

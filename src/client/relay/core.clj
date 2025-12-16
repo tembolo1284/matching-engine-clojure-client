@@ -1,12 +1,12 @@
-(ns me-client.relay.core
+(ns client.relay.core
   "Main entry point for the Matching Engine Relay Server.
    
    Connects to the matching engine, filters messages, and broadcasts
    to WebSocket clients. Optionally serves the ClojureScript UI."
-  (:require [me-client.relay.config :as config]
-            [me-client.relay.websocket :as ws]
-            [me-client.relay.engine :as engine]
-            [me-client.protocol :as proto])
+  (:require [client.relay.config :as config]
+            [client.relay.websocket :as ws]
+            [client.relay.engine :as engine]
+            [client.protocol :as proto])
   (:gen-class))
 
 ;; =============================================================================
