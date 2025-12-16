@@ -22,7 +22,7 @@
 
 ;; Message sizes
 (def ^:const NEW-ORDER-SIZE 27)
-(def ^:const CANCEL-SIZE    18)
+(def ^:const CANCEL-SIZE    10)
 (def ^:const FLUSH-SIZE     2)
 (def ^:const ACK-SIZE       18)
 (def ^:const TRADE-SIZE     34)
@@ -39,7 +39,7 @@
   "Convert symbol string to 8-byte space-padded array."
   ^bytes [^String sym]
   (let [bs (.getBytes sym StandardCharsets/US_ASCII)
-        out (byte-array SYMBOL-SIZE (byte 0x20))]  ; space-padded
+        out (byte-array SYMBOL-SIZE (byte 0x20))]
     (System/arraycopy bs 0 out 0 (min (alength bs) SYMBOL-SIZE))
     out))
 
@@ -71,15 +71,15 @@
     buf))
 
 (defn encode-cancel
-  "Encode a cancel order message (18 bytes).
+  "Encode a cancel order message (10 bytes).
+   Format: magic(1) + type(1) + user_id(4) + order_id(4)
    Returns: ByteBuffer ready to read"
-  [user-id symbol order-id]
+  [user-id _symbol order-id]
   (let [buf (ByteBuffer/allocate CANCEL-SIZE)]
     (.order buf ByteOrder/BIG_ENDIAN)
     (.put buf (byte MAGIC))
     (.put buf TYPE-CANCEL)
     (.putInt buf (int user-id))
-    (.put buf (symbol->bytes symbol))
     (.putInt buf (int order-id))
     (.flip buf)
     buf))
