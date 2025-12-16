@@ -1,10 +1,7 @@
 (ns client.core
-  "Interactive REPL client for the matching engine.
-
-   Provides a friendly interface for sending orders and viewing responses.
-   Uses shared protocol and transport modules."
-  (:require [client.protocol :as proto]
-            [client.transport :as transport])
+  "Interactive REPL client for the matching engine."
+  (:require [client.client :as client]
+            [client.protocol :as proto])
   (:gen-class))
 
 ;; =============================================================================
@@ -12,8 +9,7 @@
 ;; =============================================================================
 
 (defonce ^:private state
-  (atom {:transport nil
-         :reader-thread nil
+  (atom {:conn nil
          :user-id 1
          :next-order-id 1
          :history []}))
@@ -38,18 +34,20 @@
   (println (str "  [RECV] " (proto/format-message msg)))
   (add-to-history! msg))
 
+(defn- drain-and-print!
+  "Drain all available responses and print them."
+  ([] (drain-and-print! 100))
+  ([timeout-ms]
+   (when-let [conn (:conn @state)]
+     (doseq [msg (client/recv-all conn timeout-ms)]
+       (print-msg msg)))))
+
 ;; =============================================================================
 ;; Connection Management
 ;; =============================================================================
 
 (defn start!
-  "Connect to matching engine.
-
-   Examples:
-     (start!)                       ; localhost:1234 TCP
-     (start! 9000)                  ; localhost:9000
-     (start! \"host\" 1234)         ; custom host
-     (start! {:transport :udp})     ; UDP transport"
+  "Connect to matching engine."
   ([] (start! "localhost" 1234 {}))
   ([arg]
    (cond
@@ -59,49 +57,34 @@
      :else (start!)))
   ([host port] (start! host port {}))
   ([host port opts]
-   (when-let [old (:transport @state)]
-     (transport/close! old))
+   (when-let [old (:conn @state)]
+     (client/disconnect old))
 
-   (let [transport-type (or (:transport opts) :tcp)
-         tp (transport/connect transport-type host port)]
-     (swap! state assoc :transport tp)
-     (println (format "Connected to %s:%d via %s" host port (name transport-type)))
-
-     ;; Start reader thread
-     (let [thread (Thread.
-                   ^Runnable
-                   (fn []
-                     (while (and (:transport @state)
-                                 (transport/connected? tp))
-                       (try
-                         (when-let [msg (transport/recv-msg! tp)]
-                           (print-msg msg))
-                         (catch java.net.SocketTimeoutException _)
-                         (catch Exception e
-                           (when (transport/connected? tp)
-                             (println "Reader error:" (.getMessage e))))))))]
-       (.setDaemon thread true)
-       (.setName thread "client-reader")
-       (.start thread)
-       (swap! state assoc :reader-thread thread)))
+   (let [conn (client/connect host port opts)]
+     (swap! state assoc :conn conn)
+     (println (format "Connected to %s:%d via %s" host port (name (:type conn))))
+     
+     ;; Detect protocol
+     (let [proto (client/detect-protocol! conn)]
+       (println (format "Protocol: %s" (name proto)))))
 
    :connected))
 
 (defn stop!
   "Disconnect from matching engine."
   []
-  (when-let [tp (:transport @state)]
-    (transport/close! tp)
-    (swap! state assoc :transport nil :reader-thread nil)
+  (when-let [conn (:conn @state)]
+    (client/disconnect conn)
+    (swap! state assoc :conn nil)
     (println "Disconnected"))
   :disconnected)
 
 (defn status
   "Show connection status."
   []
-  (if-let [tp (:transport @state)]
-    (if (transport/connected? tp)
-      (println "Connected")
+  (if-let [conn (:conn @state)]
+    (if (client/connected? conn)
+      (println (format "Connected (%s)" (name (or (client/get-protocol conn) :unknown))))
       (println "Disconnected (stale)"))
     (println "Not connected")))
 
@@ -109,49 +92,40 @@
 ;; Order Commands
 ;; =============================================================================
 
-(defn- send-order! [side symbol price qty]
-  (when-let [tp (:transport @state)]
-    (let [order {:type :new-order
-                 :user-id (:user-id @state)
-                 :order-id (next-order-id!)
-                 :side side
-                 :symbol symbol
-                 :price price
-                 :qty qty}]
-      (transport/send-msg! tp order)
-      (:order-id order))))
-
 (defn buy
   "Send a buy order."
   [symbol price qty]
-  (let [oid (send-order! :buy symbol price qty)]
-    (println (format "Sent BUY %s %d @ %.2f (order #%d)" symbol qty (double price) oid))
-    oid))
+  (when-let [conn (:conn @state)]
+    (let [oid (next-order-id!)
+          user-id (:user-id @state)]
+      (println (format "Sent BUY %s %d @ %.2f (order #%d)" symbol qty (double price) oid))
+      (client/send-order! conn user-id symbol (int price) qty :buy oid)
+      oid)))
 
 (defn sell
   "Send a sell order."
   [symbol price qty]
-  (let [oid (send-order! :sell symbol price qty)]
-    (println (format "Sent SELL %s %d @ %.2f (order #%d)" symbol qty (double price) oid))
-    oid))
+  (when-let [conn (:conn @state)]
+    (let [oid (next-order-id!)
+          user-id (:user-id @state)]
+      (println (format "Sent SELL %s %d @ %.2f (order #%d)" symbol qty (double price) oid))
+      (client/send-order! conn user-id symbol (int price) qty :sell oid)
+      oid)))
 
 (defn cancel
   "Cancel an order."
   [symbol order-id]
-  (when-let [tp (:transport @state)]
-    (let [msg {:type :cancel
-               :user-id (:user-id @state)
-               :order-id order-id
-               :symbol symbol}]
-      (transport/send-msg! tp msg)
-      (println (format "Sent CANCEL %s order #%d" symbol order-id)))))
+  (when-let [conn (:conn @state)]
+    (let [user-id (:user-id @state)]
+      (println (format "Sent CANCEL %s order #%d" symbol order-id))
+      (client/send-cancel! conn user-id symbol order-id))))
 
 (defn flush!
   "Flush all order books."
   []
-  (when-let [tp (:transport @state)]
-    (transport/send-msg! tp {:type :flush})
-    (println "Sent FLUSH")))
+  (when-let [conn (:conn @state)]
+    (println "Sent FLUSH")
+    (client/send-flush! conn)))
 
 ;; =============================================================================
 ;; History
@@ -205,15 +179,18 @@
   
   (println "Sending: BUY IBM 50@100")
   (buy "IBM" 100 50)
-  (Thread/sleep 200)
+  (Thread/sleep 100)
+  (drain-and-print!)
   
   (println "\nSending: SELL IBM 50@105")
   (sell "IBM" 105 50)
-  (Thread/sleep 200)
+  (Thread/sleep 100)
+  (drain-and-print!)
   
   (println "\nSending: FLUSH")
   (flush!)
-  (Thread/sleep 300)
+  (Thread/sleep 150)
+  (drain-and-print!)
   
   (println "\n*** Scenario 1 Complete ***"))
 
@@ -223,11 +200,13 @@
   
   (println "Sending: BUY IBM 50@100")
   (buy "IBM" 100 50)
-  (Thread/sleep 200)
+  (Thread/sleep 100)
+  (drain-and-print!)
   
   (println "\nSending: SELL IBM 50@100 (should match!)")
   (sell "IBM" 100 50)
-  (Thread/sleep 300)
+  (Thread/sleep 150)
+  (drain-and-print!)
   
   (println "\n*** Scenario 2 Complete ***"))
 
@@ -237,11 +216,13 @@
   
   (println "Sending: BUY IBM 50@100")
   (let [oid (buy "IBM" 100 50)]
-    (Thread/sleep 200)
+    (Thread/sleep 100)
+    (drain-and-print!)
     
     (println (format "\nSending: CANCEL order %d" oid))
     (cancel "IBM" oid)
-    (Thread/sleep 200))
+    (Thread/sleep 100)
+    (drain-and-print!))
   
   (println "\n*** Scenario 3 Complete ***"))
 
@@ -254,15 +235,19 @@
   (reset-order-id!)
   
   (flush!)
-  (Thread/sleep 200)
+  (Thread/sleep 100)
+  (drain-and-print! 200)
   
-  (let [progress-interval (max 1 (quot count 20))
+  (let [conn (:conn @state)
+        user-id (:user-id @state)
+        progress-interval (max 1 (quot count 20))
         start-time (System/currentTimeMillis)
         sent (atom 0)]
     
     (dotimes [i count]
-      (let [price (+ 100 (mod i 100))]
-        (send-order! :buy "IBM" price 10)
+      (let [price (+ 100 (mod i 100))
+            oid (next-order-id!)]
+        (client/send-order! conn user-id "IBM" price 10 :buy oid)
         (swap! sent inc))
       
       (when (and (pos? i) (zero? (mod i progress-interval)))
@@ -272,17 +257,20 @@
           (println (format "  %d%% (%d orders, %s, %s)"
                           pct @sent (format-time elapsed) (format-rate rate)))))
       
+      ;; Interleave receives to prevent TCP buffer issues
       (when (zero? (mod i 100))
-        (Thread/sleep 2)))
+        (client/recv-all conn 1)))
     
     (let [elapsed (- (System/currentTimeMillis) start-time)]
       (println (format "\nSent %d orders in %s" @sent (format-time elapsed)))
       (println "Waiting for responses...")
       (Thread/sleep 2000)
+      (drain-and-print! 500)
       
       (println "\nSending FLUSH...")
       (flush!)
       (Thread/sleep 2000)
+      (drain-and-print! 500)
       
       (println "\n*** Stress Test Complete ***"))))
 
@@ -296,9 +284,12 @@
   (reset-order-id!)
   
   (flush!)
-  (Thread/sleep 200)
+  (Thread/sleep 100)
+  (drain-and-print! 200)
   
-  (let [progress-interval (max 1 (quot pairs 20))
+  (let [conn (:conn @state)
+        user-id (:user-id @state)
+        progress-interval (max 1 (quot pairs 20))
         batch-size (cond (>= pairs 100000) 100
                         (>= pairs 10000) 50
                         :else 25)
@@ -306,9 +297,11 @@
         pairs-sent (atom 0)]
     
     (dotimes [i pairs]
-      (let [price (+ 100 (mod i 50))]
-        (send-order! :buy "IBM" price 10)
-        (send-order! :sell "IBM" price 10)
+      (let [price (+ 100 (mod i 50))
+            buy-oid (next-order-id!)
+            sell-oid (next-order-id!)]
+        (client/send-order! conn user-id "IBM" price 10 :buy buy-oid)
+        (client/send-order! conn user-id "IBM" price 10 :sell sell-oid)
         (swap! pairs-sent inc))
       
       (when (and (pos? i) (zero? (mod i progress-interval)))
@@ -318,8 +311,9 @@
           (println (format "  %d%% | %d pairs | %s | %s trades/sec"
                           pct @pairs-sent (format-time elapsed) (format-rate rate)))))
       
+      ;; Interleave receives
       (when (zero? (mod i batch-size))
-        (Thread/sleep 5)))
+        (client/recv-all conn 1)))
     
     (let [elapsed (- (System/currentTimeMillis) start-time)
           orders-sent (* @pairs-sent 2)]
@@ -334,7 +328,8 @@
                          (>= pairs 10000) 2000
                          :else 1000)]
         (println (format "\nWaiting %d ms for server to finish..." wait-ms))
-        (Thread/sleep wait-ms))
+        (Thread/sleep wait-ms)
+        (drain-and-print! 500))
       
       (println "\n*** Matching Stress Complete ***"))))
 
@@ -355,9 +350,12 @@
     (reset-order-id!)
     
     (flush!)
-    (Thread/sleep 200)
+    (Thread/sleep 100)
+    (drain-and-print! 200)
     
-    (let [progress-interval (max 1 (quot pairs 20))
+    (let [conn (:conn @state)
+          user-id (:user-id @state)
+          progress-interval (max 1 (quot pairs 20))
           batch-size (cond (>= pairs 100000) 100
                           (>= pairs 10000) 50
                           :else 25)
@@ -366,9 +364,11 @@
       
       (dotimes [i pairs]
         (let [symbol (nth symbols (mod i 2))
-              price (+ 100 (mod i 50))]
-          (send-order! :buy symbol price 10)
-          (send-order! :sell symbol price 10)
+              price (+ 100 (mod i 50))
+              buy-oid (next-order-id!)
+              sell-oid (next-order-id!)]
+          (client/send-order! conn user-id symbol price 10 :buy buy-oid)
+          (client/send-order! conn user-id symbol price 10 :sell sell-oid)
           (swap! pairs-sent inc))
         
         (when (and (pos? i) (zero? (mod i progress-interval)))
@@ -378,8 +378,9 @@
             (println (format "  %d%% | %d pairs | %s | %s trades/sec"
                             pct @pairs-sent (format-time elapsed) (format-rate rate)))))
         
+        ;; Interleave receives
         (when (zero? (mod i batch-size))
-          (Thread/sleep 5)))
+          (client/recv-all conn 1)))
       
       (let [elapsed (- (System/currentTimeMillis) start-time)
             orders-sent (* @pairs-sent 2)]
@@ -397,7 +398,8 @@
                            (>= pairs 10000) 2000
                            :else 1000)]
           (println (format "\nWaiting %d ms for server to finish..." wait-ms))
-          (Thread/sleep wait-ms))
+          (Thread/sleep wait-ms)
+          (drain-and-print! 500))
         
         (println "\n*** Dual-Processor Stress Complete ***")))))
 
