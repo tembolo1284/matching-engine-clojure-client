@@ -1,17 +1,59 @@
-{:paths ["src"]
+{:paths ["src" "resources"]
  
- :deps {org.clojure/clojure {:mvn/version "1.12.0"}}
+ :deps
+ {org.clojure/clojure {:mvn/version "1.11.1"}
+  http-kit/http-kit   {:mvn/version "2.7.0"}}
  
  :aliases
- {:dev {:extra-paths ["test"]
-        :extra-deps {org.clojure/test.check {:mvn/version "1.1.1"}}}
+ {;; REPL client for interactive use
+  :repl
+  {:main-opts ["-m" "me-client.client.core"]
+   :extra-paths ["dev"]}
   
-  :test {:extra-paths ["test"]
-         :extra-deps {org.clojure/test.check {:mvn/version "1.1.1"}
-                      io.github.cognitect-labs/test-runner {:git/tag "v0.5.1" 
-                                                            :git/sha "dfb30dd"}}
-         :main-opts ["-m" "cognitect.test-runner"]
-         :exec-fn cognitect.test-runner.api/test}
+  ;; Relay server
+  :relay
+  {:main-opts ["-m" "me-client.relay.core"]}
   
-  :repl {:main-opts ["-e" "(require '[client.core :refer :all])"
-                     "-r"]}}}
+  ;; nREPL for editor integration
+  :nrepl
+  {:extra-deps {nrepl/nrepl {:mvn/version "1.0.0"}
+                cider/cider-nrepl {:mvn/version "0.31.0"}}
+   :main-opts ["-m" "nrepl.cmdline" "--middleware" "[cider.nrepl/cider-middleware]"]}
+  
+  ;; Build uberjars
+  :uberjar
+  {:extra-deps {com.github.seancorfield/depstar {:mvn/version "2.1.303"}}
+   :ns-default hf.depstar}
+  
+  ;; Build client jar
+  :build-client
+  {:extra-deps {com.github.seancorfield/depstar {:mvn/version "2.1.303"}}
+   :exec-fn hf.depstar/uberjar
+   :exec-args {:jar "target/me-client.jar"
+               :aot true
+               :main-class me_client.client.core}}
+  
+  ;; Build relay jar
+  :build-relay
+  {:extra-deps {com.github.seancorfield/depstar {:mvn/version "2.1.303"}}
+   :exec-fn hf.depstar/uberjar
+   :exec-args {:jar "target/me-relay.jar"
+               :aot true
+               :main-class me_client.relay.core}}
+  
+  ;; Run tests
+  :test
+  {:extra-paths ["test"]
+   :extra-deps {io.github.cognitect-labs/test-runner {:git/tag "v0.5.1"
+                                                       :git/sha "dfb30dd"}
+                org.java-websocket/Java-WebSocket {:mvn/version "1.5.4"}}
+   :main-opts ["-m" "cognitect.test-runner"]
+   :exec-fn cognitect.test-runner.api/test}
+  
+  ;; Run specific test namespace
+  :test-ns
+  {:extra-paths ["test"]
+   :extra-deps {io.github.cognitect-labs/test-runner {:git/tag "v0.5.1"
+                                                       :git/sha "dfb30dd"}
+                org.java-websocket/Java-WebSocket {:mvn/version "1.5.4"}}
+   :main-opts ["-m" "cognitect.test-runner"]}}}

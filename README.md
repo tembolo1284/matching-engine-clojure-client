@@ -1,248 +1,448 @@
-# Clojure Matching Engine Client
+# Matching Engine Client & Relay
 
-A REPL-friendly client for the matching engine with protocol auto-detection, TCP/UDP support, and stress test scenarios.
+A Clojure toolkit for interacting with binary-protocol matching engines. Includes an interactive REPL client, a WebSocket relay server, and a ClojureScript position manager UI.
 
 ## Features
 
-- **Protocol Auto-Detection**: Automatically detects binary vs CSV protocol
-- **Dual Transport**: TCP (default) and UDP with bidirectional communication
-- **Stress Test Scenarios**: 15 scenarios from basic tests to 250M trade stress tests
-- **Wire Compatible**: Works with C, Rust, Zig, and Java matching engines
-- **REPL-Driven**: Interactive trading from the Clojure REPL
+- **Binary Protocol**: Full encoder/decoder for the matching engine wire format
+- **Multiple Transports**: TCP, UDP, and multicast support
+- **REPL Client**: Interactive trading terminal with test scenarios
+- **WebSocket Relay**: Broadcast market data to browser clients
+- **Position Manager UI**: Real-time ClojureScript dashboard for orders and trades
+- **Standalone JARs**: Deploy without Clojure installed
 
 ## Quick Start
 
+See [QUICK_START.md](QUICK_START.md) for a complete walkthrough.
 ```bash
-# Start the matching engine (any language version)
-cd ~/java-workspace/matching-engine-java
-java -jar target/java-matching-engine-0.1.0-SNAPSHOT.jar
+# Start relay with UI
+clojure -M:relay -e localhost:1234 -w 8080
 
-# In another terminal, start the Clojure REPL
-cd clojure-me-client
-clj -M:repl
-```
+# Open browser
+open http://localhost:8080
 
-```clojure
-;; Connect with auto protocol detection
+# Send orders via REPL
+clojure -M:repl
 (start!)
-;; => Connected to localhost:1234 via tcp
-;; => Detecting protocol... binary
-
-;; Place orders
-(buy "IBM" 100.50 100)    ; Buy 100 IBM @ $100.50
-(sell "IBM" 100.50 100)   ; Sell - creates trade!
-
-;; Run stress test
-(scenario 20)             ; 1K matching trades
-
-;; Disconnect
-(stop!)
+(buy "IBM" 100.00 50)
 ```
 
 ## Installation
 
-Requires [Clojure CLI tools](https://clojure.org/guides/install_clojure).
+### Prerequisites
 
+- Java 11+
+- Clojure CLI (clj)
+- Node.js 16+ (for UI development only)
+
+### Clone and Build
 ```bash
-cd clojure-me-client
-clj -M:repl
+git clone <repo-url>
+cd me-client
+
+# Install ClojureScript dependencies (optional, for UI dev)
+npm install
+
+# Build production JARs
+clojure -X:build-client
+clojure -X:build-relay
+
+# Build production JS
+npm run release
 ```
 
-## API Reference
+## Components
 
-### Connection
+### REPL Client
 
+Interactive client for sending orders and viewing responses:
+```bash
+clojure -M:repl
+```
 ```clojure
-;; Basic connection (TCP, auto-detect protocol)
-(start!)                          ; localhost:1234
-(start! 9000)                     ; localhost:9000
-(start! "host" 1234)              ; custom host:port
+(start!)                      ; Connect to localhost:1234
+(start! "host" 9000)          ; Connect to custom host/port
+(start! {:transport :udp})    ; Use UDP transport
 
-;; Force protocol
-(start! :binary)                  ; Force binary protocol
-(start! :csv)                     ; Force CSV protocol
+(buy "IBM" 100.00 50)         ; Buy 50 shares @ $100.00
+(sell "IBM" 100.00 50)        ; Sell 50 shares @ $100.00
+(cancel "IBM" 1)              ; Cancel order #1
+(flush!)                      ; Clear all order books
 
-;; UDP transport
-(start! {:transport :udp})        ; UDP to localhost:1234
-(start! "host" 1234 {:transport :udp :protocol :binary})
+(show)                        ; View last 10 messages
+(show 50)                     ; View last 50 messages
+(scenario)                    ; List test scenarios
+(scenario 2)                  ; Run matching trade test
 
-;; Connection management
-(stop!)                           ; Disconnect
-(connected?)                      ; Check connection status
-(protocol)                        ; Show current protocol (:binary or :csv)
+(status)                      ; Connection status
+(stop!)                       ; Disconnect
+(help)                        ; Show all commands
 ```
 
-### Trading
+### Relay Server
 
+WebSocket relay for browser clients:
+```bash
+# Basic usage
+clojure -M:relay -e localhost:1234 -w 8080
+
+# With multicast market data
+clojure -M:relay -t multicast -m 239.255.1.1 -w 8080
+
+# Verbose logging
+clojure -M:relay -e localhost:1234 -v
+
+# Custom message filter
+clojure -M:relay -e localhost:1234 -f trade,order-ack
+
+# See all options
+clojure -M:relay --help
+```
+
+### Position Manager UI
+
+Real-time dashboard showing orders, trades, and message log:
+```bash
+# Development mode (hot reload)
+npm run dev
+# Open http://localhost:3000
+
+# Production build
+npm run release
+# JS compiled to resources/public/js/main.js
+```
+
+Features:
+- Real-time order tracking
+- Trade execution feed
+- Message log with filtering
+- Symbol filter
+- Connection status indicator
+- Statistics dashboard
+
+## Building JARs
+
+Build standalone JARs for deployment:
+```bash
+# Build REPL client JAR
+clojure -X:build-client
+
+# Build relay server JAR
+clojure -X:build-relay
+
+# JARs created in target/
+ls target/
+# me-client.jar
+# me-relay.jar
+```
+
+### Running JARs
+```bash
+# Run client
+java -jar target/me-client.jar localhost 1234
+
+# Run relay server
+java -jar target/me-relay.jar --engine localhost:1234 --ws-port 8080
+```
+
+## Architecture
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                           me-client                                 │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  ┌────────────────────────┐      ┌────────────────────────┐        │
+│  │     protocol.clj       │      │     transport.clj      │        │
+│  │  ┌────────────────┐    │      │  ┌────────────────┐    │        │
+│  │  │ Binary Codec   │    │      │  │ TCP            │    │        │
+│  │  │ Message Framing│    │      │  │ UDP            │    │        │
+│  │  │ Type Constants │    │      │  │ Multicast      │    │        │
+│  │  └────────────────┘    │      │  └────────────────┘    │        │
+│  └───────────┬────────────┘      └───────────┬────────────┘        │
+│              │                               │                      │
+│              └───────────┬───────────────────┘                      │
+│                          │                                          │
+│          ┌───────────────┼───────────────┐                         │
+│          │               │               │                         │
+│   ┌──────▼──────┐ ┌──────▼──────┐ ┌──────▼──────┐                  │
+│   │   client/   │ │    relay/   │ │    cljs/    │                  │
+│   │             │ │             │ │             │                  │
+│   │  core.clj   │ │  config.clj │ │  config.cljs│                  │
+│   │             │ │  engine.clj │ │  db.cljs    │                  │
+│   │  REPL CLI   │ │  websocket  │ │  events.cljs│                  │
+│   │  Orders     │ │  core.clj   │ │  subs.cljs  │                  │
+│   │  Scenarios  │ │             │ │  views.cljs │                  │
+│   │             │ │             │ │  core.cljs  │                  │
+│   └─────────────┘ └──────┬──────┘ └──────┬──────┘                  │
+│                          │               │                          │
+│                          │    WebSocket  │                          │
+│                          └───────┬───────┘                          │
+│                                  │                                  │
+│                          ┌───────▼───────┐                          │
+│                          │   Browser     │                          │
+│                          │   Position    │                          │
+│                          │   Manager UI  │                          │
+│                          └───────────────┘                          │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+## Configuration
+
+### Relay Server Options
+
+| Flag | Env Var | Default | Description |
+|------|---------|---------|-------------|
+| `-e, --engine HOST:PORT` | `ENGINE_HOST`, `ENGINE_PORT` | localhost:1234 | Engine address |
+| `-t, --transport TYPE` | `ENGINE_TRANSPORT` | tcp | tcp, udp, or multicast |
+| `-m, --multicast GROUP` | `MULTICAST_GROUP` | - | Multicast group address |
+| `-i, --interface IFACE` | `MULTICAST_IFACE` | - | Network interface |
+| `-w, --ws-port PORT` | `WS_PORT` | 8080 | WebSocket port |
+| `-b, --bind HOST` | `WS_HOST` | 0.0.0.0 | Bind address |
+| `-f, --filter TYPES` | `MESSAGE_FILTER` | trade,order-ack,... | Message types to relay |
+| `-c, --config FILE` | - | relay.edn | Config file path |
+| `--no-static` | `SERVE_STATIC` | true | Disable static file serving |
+| `-v, --verbose` | `LOG_LEVEL` | info | Enable debug logging |
+
+### Config File
+
+Create `relay.edn` in the working directory:
 ```clojure
-(buy symbol price qty)            ; Place buy order
-(buy "IBM" 100.50 100)
-(buy "AAPL" 150 50 1001)          ; With explicit order ID
-
-(sell symbol price qty)           ; Place sell order
-(sell "IBM" 100.50 100)
-
-(cancel symbol order-id)          ; Cancel order
-(cancel "IBM" 1)
-
-(flush!)                          ; Clear all order books
+{:engine-host "192.168.1.100"
+ :engine-port 1234
+ :engine-transport :tcp
+ :ws-port 8080
+ :ws-host "0.0.0.0"
+ :serve-static true
+ :message-filter #{:trade :order-ack :order-reject :cancel-ack :cancel-reject}
+ :log-level :info}
 ```
 
-### Reading
-
-```clojure
-(recv)                            ; Get pending messages
-(show)                            ; Show last 10 messages
-(show 20)                         ; Show last 20 messages
+### Environment Variables
+```bash
+export ENGINE_HOST=192.168.1.100
+export ENGINE_PORT=1234
+export ENGINE_TRANSPORT=tcp
+export WS_PORT=8080
+export MESSAGE_FILTER=trade,order-ack,cancel-ack
+export LOG_LEVEL=debug
 ```
 
-### Scenarios
+## Protocol
 
-```clojure
-(scenario)                        ; List all scenarios
-(scenario 1)                      ; Simple orders
-(scenario 2)                      ; Matching trade
-(scenario 3)                      ; Cancel order
-(scenario 20)                     ; 1K matching stress
-(scenario 22)                     ; 100K matching stress
-(scenario 25)                     ; 250M trades (LEGENDARY)
-(scenario 30)                     ; Dual-processor 500K
+Wire format (little-endian):
+```
+┌──────────┬──────────┬─────────────────┐
+│ Magic    │ Length   │ Payload         │
+│ 2 bytes  │ 2 bytes  │ N bytes         │
+│ 0x4D45   │ uint16   │ (type+fields)   │
+└──────────┴──────────┴─────────────────┘
 ```
 
-**Available Scenarios:**
+### Message Types
 
-| # | Name | Description |
-|---|------|-------------|
-| 1 | Simple Orders | Two non-matching orders |
-| 2 | Matching Trade | Buy and sell at same price |
-| 3 | Cancel Order | Place and cancel |
-| 10-12 | Unmatched Stress | 1K, 10K, 100K unmatched orders |
-| 20-25 | Matching Stress | 1K to 250M matching trades |
-| 30-32 | Dual Processor | 500K to 100M trades on IBM+NVDA |
+| Type | Code | Direction | Description |
+|------|------|-----------|-------------|
+| NewOrder | 0x01 | Client→Engine | Submit new order |
+| Cancel | 0x02 | Client→Engine | Cancel order |
+| Flush | 0x03 | Client→Engine | Clear all books |
+| OrderAck | 0x10 | Engine→Client | Order accepted |
+| OrderReject | 0x11 | Engine→Client | Order rejected |
+| CancelAck | 0x12 | Engine→Client | Cancel confirmed |
+| CancelReject | 0x13 | Engine→Client | Cancel rejected |
+| Trade | 0x20 | Engine→Client | Trade executed |
+| BookUpdate | 0x21 | Engine→Client | Book changed |
 
-### Utilities
+### Field Sizes
 
-```clojure
-(user! 42)                        ; Set user ID
+| Field | Size | Type |
+|-------|------|------|
+| user-id | 4 bytes | uint32 |
+| order-id | 4 bytes | uint32 |
+| symbol | 8 bytes | ASCII, space-padded |
+| price | 8 bytes | float64 |
+| qty | 4 bytes | uint32 |
+| side | 1 byte | 0x01=buy, 0x02=sell |
+| reason | 1 byte | reject reason code |
 
-(match! "IBM" 100 50)             ; Create matching trade (buy + sell)
+## WebSocket API
 
-(ladder! "IBM" :buy 100 10 5)     ; 5 buy orders from $100 down
-(ladder! "IBM" :sell 101 10 5)    ; 5 sell orders from $101 up
+Connect to `ws://host:port/ws` to receive JSON messages:
+```javascript
+const ws = new WebSocket('ws://localhost:8080/ws');
 
-(status)                          ; Show connection status
-(help)                            ; Show all commands
+ws.onmessage = (event) => {
+  const msg = JSON.parse(event.data);
+  
+  switch (msg.type) {
+    case 'trade':
+      console.log(`Trade: ${msg.symbol} ${msg.qty} @ ${msg.price}`);
+      break;
+    case 'order-ack':
+      console.log(`Order ${msg['order-id']} acknowledged`);
+      break;
+    case 'cancel-ack':
+      console.log(`Cancel ${msg['order-id']} confirmed`);
+      break;
+  }
+};
 ```
 
-## Protocol Details
+### Message Formats
 
-The client auto-detects the server's protocol by:
-1. Sending a binary probe order
-2. If binary response received → use binary
-3. Otherwise try CSV probe → use CSV
-4. Default to binary if no response
-
-### Binary Protocol
-
-- Magic byte: `0x4D` ('M')
-- Big-endian integers
-- 8-byte null-padded symbols
-
-| Message | Size |
-|---------|------|
-| NewOrder | 27 bytes |
-| Cancel | 18 bytes |
-| Flush | 2 bytes |
-| Ack | 18 bytes |
-| Trade | 34 bytes |
-| TopOfBook | 20 bytes |
-
-### CSV Protocol
-
-```
-N,<user_id>,<symbol>,<price>,<qty>,<side>,<order_id>
-C,<user_id>,<symbol>,<order_id>
-F
-A,<symbol>,<user_id>,<order_id>
-T,<symbol>,<buy_uid>,<buy_oid>,<sell_uid>,<sell_oid>,<price>,<qty>
-B,<symbol>,<side>,<price>,<qty>
+**Trade**
+```json
+{
+  "type": "trade",
+  "symbol": "IBM",
+  "price": 100.50,
+  "qty": 100,
+  "buy-user-id": 1,
+  "buy-order-id": 1,
+  "sell-user-id": 2,
+  "sell-order-id": 1
+}
 ```
 
-## Example Session
-
-```clojure
-user=> (start!)
-Connected to localhost:1234 via tcp
-Detecting protocol... binary
-:connected
-
-user=> (buy "IBM" 100 50)
-→ BUY IBM $100.00 qty=50 (order 1)
-  ACK: IBM user=1 order=1
-  TOB: IBM buy $100.00 qty=50
-1
-
-user=> (sell "IBM" 100 50)
-→ SELL IBM $100.00 qty=50 (order 2)
-  ACK: IBM user=1 order=2
-  TRADE: IBM $100.00 qty=50 buy=1/1 sell=1/2
-  TOB: IBM buy ELIMINATED
-2
-
-user=> (scenario 20)
-=== Matching Stress Test: 1K Trades ===
-
-Target: 1K trades (2K orders)
-Throttling: 50 pairs/batch, 10ms delay (interleaved recv)
-  10% | 100 pairs | 123 ms | 813 trades/sec | recv'd: 487
-  20% | 200 pairs | 246 ms | 813 trades/sec | recv'd: 974
-  ...
-
-=== Send Results ===
-Trade pairs:     1000
-Orders sent:     2000
-Send errors:     0
-Total time:      1.234 sec
-
-=== Throughput ===
-Orders/sec:      1.62K/sec
-Trades/sec:      810/sec
-
-=== Server Response Summary ===
-ACKs:            2000
-Trades:          1000
-Top of Book:     2000
-Total messages:  5000
-
-=== Validation ===
-ACKs:            2000/2000 ✓ PASS
-Trades:          1000/1000 ✓ PASS
-
-*** TEST PASSED ***
-
-user=> (stop!)
-Disconnected
-:disconnected
+**Order Ack**
+```json
+{
+  "type": "order-ack",
+  "user-id": 1,
+  "order-id": 1,
+  "symbol": "IBM"
+}
 ```
 
-## Wire Compatibility
+**Cancel Ack**
+```json
+{
+  "type": "cancel-ack",
+  "user-id": 1,
+  "order-id": 1,
+  "symbol": "IBM"
+}
+```
 
-This client is compatible with:
+### HTTP Endpoints
 
-| Engine | Binary | CSV |
-|--------|--------|-----|
-| C Matching Engine | ✅ | ✅ |
-| Rust Matching Engine | ✅ | ✅ |
-| Zig Matching Engine | ✅ | ✅ |
-| Java Matching Engine | ✅ | ✅ |
+| Endpoint | Description |
+|----------|-------------|
+| `GET /` | Position Manager UI |
+| `GET /ws` | WebSocket upgrade |
+| `GET /health` | Server health check |
+| `GET /clients` | Connected client list |
+
+## Project Structure
+```
+me-client/
+├── deps.edn                    # Clojure dependencies
+├── shadow-cljs.edn             # ClojureScript build config
+├── package.json                # Node dependencies
+├── README.md
+├── QUICK_START.md
+├── relay.edn                   # Optional config file
+├── src/
+│   ├── me_client/              # Clojure source
+│   │   ├── protocol.clj        # Binary codec (shared)
+│   │   ├── transport.clj       # TCP/UDP/multicast (shared)
+│   │   ├── client/
+│   │   │   └── core.clj        # REPL client
+│   │   └── relay/
+│   │       ├── config.clj      # CLI/env/file config
+│   │       ├── engine.clj      # Engine connection
+│   │       ├── websocket.clj   # WebSocket server
+│   │       └── core.clj        # Main entry point
+│   └── cljs/
+│       └── position_manager/   # ClojureScript source
+│           ├── config.cljs
+│           ├── db.cljs
+│           ├── events.cljs
+│           ├── subs.cljs
+│           ├── views.cljs
+│           ├── websocket.cljs
+│           └── core.cljs
+├── test/
+│   └── me_client/
+│       ├── protocol_test.clj
+│       ├── transport_test.clj
+│       ├── config_test.clj
+│       ├── websocket_test.clj
+│       └── engine_test.clj
+├── resources/
+│   └── public/
+│       ├── index.html
+│       └── js/                 # Compiled ClojureScript
+└── target/
+    ├── me-client.jar
+    └── me-relay.jar
+```
 
 ## Development
-
 ```bash
-# Run tests
-clj -M:test
+# Start nREPL for editor integration
+clojure -M:nrepl
 
-# Start dev REPL
-clj -M:dev
+# Run tests
+clojure -X:test
+
+# ClojureScript development
+npm run dev
+
+# Clean build artifacts
+npm run clean
+rm -rf target/
 ```
 
+## Testing
+```bash
+# Run all tests
+clojure -X:test
+
+# Run specific namespace
+clojure -M:test -n me-client.protocol-test
+
+# Run with verbose output
+clojure -M:test -v
+```
+
+## Compatibility
+
+This client is compatible with matching engines using the standard binary protocol:
+
+- [C Matching Engine](../matching-engine-c/)
+- [Rust Matching Engine](../matching-engine-rust/)
+- [Zig Matching Engine](../matching-engine-zig/)
+- [Java Matching Engine](../matching-engine-java/)
+
+## Troubleshooting
+
+### Connection Refused
+```
+Error: Connection refused
+```
+Ensure the matching engine is running and the host/port are correct.
+
+### Multicast Not Receiving
+```bash
+# Check interface
+ip addr show
+
+# Use specific interface
+clojure -M:relay -t multicast -m 239.255.1.1 -i eth0
+```
+
+### JAR Build Fails
+```bash
+# Ensure AOT compilation
+clojure -X:build-relay
+```
+
+### UI Not Loading
+```bash
+# Build JS first
+npm run release
+
+# Or run in dev mode
+npm run dev
+```
