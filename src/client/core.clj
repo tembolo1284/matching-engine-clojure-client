@@ -10,6 +10,8 @@
 
 (defonce ^:private state
   (atom {:conn nil
+         :reader-thread nil
+         :reader-running (atom false)
          :user-id 1
          :next-order-id 1
          :history []}))
@@ -34,13 +36,39 @@
   (println (str "  [RECV] " (proto/format-message msg)))
   (add-to-history! msg))
 
-(defn- drain-and-print!
-  "Drain all available responses and print them."
-  ([] (drain-and-print! 100))
-  ([timeout-ms]
-   (when-let [conn (:conn @state)]
-     (doseq [msg (client/recv-all conn timeout-ms)]
-       (print-msg msg)))))
+;; =============================================================================
+;; Background Reader Thread
+;; =============================================================================
+
+(defn- start-reader-thread! []
+  (let [running (:reader-running @state)]
+    (reset! running true)
+    (let [thread (Thread.
+                  ^Runnable
+                  (fn []
+                    (while @running
+                      (try
+                        (when-let [conn (:conn @state)]
+                          (when (client/connected? conn)
+                            (when-let [msg (client/recv-message conn 100)]
+                              (print-msg msg))))
+                        (catch java.net.SocketTimeoutException _)
+                        (catch java.io.EOFException _
+                          (reset! running false))
+                        (catch Exception e
+                          (when @running
+                            (println "Reader error:" (.getMessage e))))))))]
+      (.setDaemon thread true)
+      (.setName thread "client-reader")
+      (.start thread)
+      (swap! state assoc :reader-thread thread))))
+
+(defn- stop-reader-thread! []
+  (when-let [running (:reader-running @state)]
+    (reset! running false))
+  (when-let [thread (:reader-thread @state)]
+    (try (.interrupt thread) (catch Exception _)))
+  (swap! state assoc :reader-thread nil))
 
 ;; =============================================================================
 ;; Connection Management
@@ -57,22 +85,31 @@
      :else (start!)))
   ([host port] (start! host port {}))
   ([host port opts]
+   ;; Clean up old connection
+   (stop-reader-thread!)
    (when-let [old (:conn @state)]
      (client/disconnect old))
 
    (let [conn (client/connect host port opts)]
-     (swap! state assoc :conn conn)
+     (swap! state assoc 
+            :conn conn
+            :reader-running (atom false))
      (println (format "Connected to %s:%d via %s" host port (name (:type conn))))
      
      ;; Detect protocol
      (let [proto (client/detect-protocol! conn)]
-       (println (format "Protocol: %s" (name proto)))))
+       (println (format "Protocol: %s" (name proto))))
+     
+     ;; Start background reader
+     (start-reader-thread!)
+     (println "Reader thread started"))
 
    :connected))
 
 (defn stop!
   "Disconnect from matching engine."
   []
+  (stop-reader-thread!)
   (when-let [conn (:conn @state)]
     (client/disconnect conn)
     (swap! state assoc :conn nil)
@@ -84,7 +121,9 @@
   []
   (if-let [conn (:conn @state)]
     (if (client/connected? conn)
-      (println (format "Connected (%s)" (name (or (client/get-protocol conn) :unknown))))
+      (println (format "Connected (%s), reader: %s" 
+                       (name (or (client/get-protocol conn) :unknown))
+                       (if @(:reader-running @state) "running" "stopped")))
       (println "Disconnected (stale)"))
     (println "Not connected")))
 
@@ -179,18 +218,15 @@
   
   (println "Sending: BUY IBM 50@100")
   (buy "IBM" 100 50)
-  (Thread/sleep 100)
-  (drain-and-print!)
+  (Thread/sleep 200)
   
   (println "\nSending: SELL IBM 50@105")
   (sell "IBM" 105 50)
-  (Thread/sleep 100)
-  (drain-and-print!)
+  (Thread/sleep 200)
   
   (println "\nSending: FLUSH")
   (flush!)
-  (Thread/sleep 150)
-  (drain-and-print!)
+  (Thread/sleep 300)
   
   (println "\n*** Scenario 1 Complete ***"))
 
@@ -200,13 +236,11 @@
   
   (println "Sending: BUY IBM 50@100")
   (buy "IBM" 100 50)
-  (Thread/sleep 100)
-  (drain-and-print!)
+  (Thread/sleep 200)
   
   (println "\nSending: SELL IBM 50@100 (should match!)")
   (sell "IBM" 100 50)
-  (Thread/sleep 150)
-  (drain-and-print!)
+  (Thread/sleep 300)
   
   (println "\n*** Scenario 2 Complete ***"))
 
@@ -216,13 +250,11 @@
   
   (println "Sending: BUY IBM 50@100")
   (let [oid (buy "IBM" 100 50)]
-    (Thread/sleep 100)
-    (drain-and-print!)
+    (Thread/sleep 200)
     
     (println (format "\nSending: CANCEL order %d" oid))
     (cancel "IBM" oid)
-    (Thread/sleep 100)
-    (drain-and-print!))
+    (Thread/sleep 200))
   
   (println "\n*** Scenario 3 Complete ***"))
 
@@ -235,8 +267,7 @@
   (reset-order-id!)
   
   (flush!)
-  (Thread/sleep 100)
-  (drain-and-print! 200)
+  (Thread/sleep 200)
   
   (let [conn (:conn @state)
         user-id (:user-id @state)
@@ -257,20 +288,17 @@
           (println (format "  %d%% (%d orders, %s, %s)"
                           pct @sent (format-time elapsed) (format-rate rate)))))
       
-      ;; Interleave receives to prevent TCP buffer issues
       (when (zero? (mod i 100))
-        (client/recv-all conn 1)))
+        (Thread/sleep 2)))
     
     (let [elapsed (- (System/currentTimeMillis) start-time)]
       (println (format "\nSent %d orders in %s" @sent (format-time elapsed)))
       (println "Waiting for responses...")
       (Thread/sleep 2000)
-      (drain-and-print! 500)
       
       (println "\nSending FLUSH...")
       (flush!)
       (Thread/sleep 2000)
-      (drain-and-print! 500)
       
       (println "\n*** Stress Test Complete ***"))))
 
@@ -284,8 +312,7 @@
   (reset-order-id!)
   
   (flush!)
-  (Thread/sleep 100)
-  (drain-and-print! 200)
+  (Thread/sleep 200)
   
   (let [conn (:conn @state)
         user-id (:user-id @state)
@@ -311,9 +338,8 @@
           (println (format "  %d%% | %d pairs | %s | %s trades/sec"
                           pct @pairs-sent (format-time elapsed) (format-rate rate)))))
       
-      ;; Interleave receives
       (when (zero? (mod i batch-size))
-        (client/recv-all conn 1)))
+        (Thread/sleep 5)))
     
     (let [elapsed (- (System/currentTimeMillis) start-time)
           orders-sent (* @pairs-sent 2)]
@@ -328,8 +354,7 @@
                          (>= pairs 10000) 2000
                          :else 1000)]
         (println (format "\nWaiting %d ms for server to finish..." wait-ms))
-        (Thread/sleep wait-ms)
-        (drain-and-print! 500))
+        (Thread/sleep wait-ms))
       
       (println "\n*** Matching Stress Complete ***"))))
 
@@ -350,8 +375,7 @@
     (reset-order-id!)
     
     (flush!)
-    (Thread/sleep 100)
-    (drain-and-print! 200)
+    (Thread/sleep 200)
     
     (let [conn (:conn @state)
           user-id (:user-id @state)
@@ -378,9 +402,8 @@
             (println (format "  %d%% | %d pairs | %s | %s trades/sec"
                             pct @pairs-sent (format-time elapsed) (format-rate rate)))))
         
-        ;; Interleave receives
         (when (zero? (mod i batch-size))
-          (client/recv-all conn 1)))
+          (Thread/sleep 5)))
       
       (let [elapsed (- (System/currentTimeMillis) start-time)
             orders-sent (* @pairs-sent 2)]
@@ -398,8 +421,7 @@
                            (>= pairs 10000) 2000
                            :else 1000)]
           (println (format "\nWaiting %d ms for server to finish..." wait-ms))
-          (Thread/sleep wait-ms)
-          (drain-and-print! 500))
+          (Thread/sleep wait-ms))
         
         (println "\n*** Dual-Processor Stress Complete ***")))))
 

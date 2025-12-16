@@ -1,9 +1,10 @@
 (ns client.transport
-  "Transport layer for TCP, UDP, and multicast connections."
+  "Transport layer for TCP, UDP, and multicast connections.
+   Used by relay for receiving market data."
   (:require [client.protocol :as proto])
   (:import [java.net Socket DatagramSocket DatagramPacket
             InetAddress InetSocketAddress MulticastSocket NetworkInterface]
-           [java.io BufferedInputStream BufferedOutputStream]))
+           [java.io BufferedInputStream BufferedOutputStream DataInputStream DataOutputStream]))
 
 ;; =============================================================================
 ;; Protocol
@@ -16,19 +17,49 @@
   (connected? [this]))
 
 ;; =============================================================================
-;; TCP Transport
+;; Helper - convert ByteBuffer to bytes
 ;; =============================================================================
 
-(defrecord TcpTransport [^Socket socket ^BufferedInputStream in ^BufferedOutputStream out]
+(defn- buf->bytes
+  "Convert ByteBuffer to byte array."
+  [^java.nio.ByteBuffer buf]
+  (let [arr (byte-array (.remaining buf))]
+    (.get buf arr)
+    arr))
+
+;; =============================================================================
+;; TCP Transport (length-prefixed framing)
+;; =============================================================================
+
+(defrecord TcpTransport [^Socket socket ^DataInputStream in ^DataOutputStream out]
   Transport
   (send-msg! [_ msg]
-    (let [bs (proto/encode-message msg)]
-      (.write out bs)
+    ;; Send using length-prefixed framing (4-byte big-endian length)
+    (let [data (case (:type msg)
+                 :new-order (buf->bytes (proto/encode-new-order
+                                         (:user-id msg)
+                                         (:symbol msg)
+                                         (:price msg)
+                                         (:qty msg)
+                                         (:side msg)
+                                         (:order-id msg)))
+                 :cancel    (buf->bytes (proto/encode-cancel
+                                         (:user-id msg)
+                                         (:symbol msg)
+                                         (:order-id msg)))
+                 :flush     (buf->bytes (proto/encode-flush))
+                 (throw (ex-info "Unknown message type" {:type (:type msg)})))]
+      (.writeInt out (alength data))
+      (.write out data)
       (.flush out)))
   
   (recv-msg! [_]
-    ;; Let SocketTimeoutException propagate - caller handles it
-    (proto/read-frame in))
+    ;; Read length-prefixed frame
+    (let [len (.readInt in)]
+      (when (and (pos? len) (< len 65536))
+        (let [arr (byte-array len)]
+          (.readFully in arr)
+          (proto/decode-auto arr)))))
   
   (close! [_]
     (try (.close socket) (catch Exception _)))
@@ -41,13 +72,12 @@
   [host port & {:keys [timeout] :or {timeout 5000}}]
   (let [socket (Socket.)]
     (.connect socket (InetSocketAddress. ^String host ^int port) timeout)
-    ;; Short read timeout so reader thread stays responsive
     (.setSoTimeout socket 100)
     (.setTcpNoDelay socket true)
     (->TcpTransport
      socket
-     (BufferedInputStream. (.getInputStream socket))
-     (BufferedOutputStream. (.getOutputStream socket)))))
+     (DataInputStream. (BufferedInputStream. (.getInputStream socket)))
+     (DataOutputStream. (BufferedOutputStream. (.getOutputStream socket))))))
 
 ;; =============================================================================
 ;; UDP Transport
@@ -57,8 +87,21 @@
                          ^bytes recv-buf]
   Transport
   (send-msg! [_ msg]
-    (let [bs (proto/encode-message msg)
-          pkt (DatagramPacket. bs (alength bs) addr port)]
+    (let [data (case (:type msg)
+                 :new-order (buf->bytes (proto/encode-new-order
+                                         (:user-id msg)
+                                         (:symbol msg)
+                                         (:price msg)
+                                         (:qty msg)
+                                         (:side msg)
+                                         (:order-id msg)))
+                 :cancel    (buf->bytes (proto/encode-cancel
+                                         (:user-id msg)
+                                         (:symbol msg)
+                                         (:order-id msg)))
+                 :flush     (buf->bytes (proto/encode-flush))
+                 (throw (ex-info "Unknown message type" {:type (:type msg)})))
+          pkt (DatagramPacket. data (alength data) addr port)]
       (.send socket pkt)))
   
   (recv-msg! [_]
@@ -66,10 +109,7 @@
       (.receive socket pkt)
       (let [data (byte-array (.getLength pkt))]
         (System/arraycopy (.getData pkt) 0 data 0 (.getLength pkt))
-        (when (>= (alength data) 4)
-          (let [payload (byte-array (- (alength data) 4))]
-            (System/arraycopy data 4 payload 0 (alength payload))
-            (proto/decode-payload payload))))))
+        (proto/decode-auto data))))
   
   (close! [_]
     (.close socket))
@@ -85,7 +125,7 @@
     (->UdpTransport socket addr port (byte-array 65536))))
 
 ;; =============================================================================
-;; Multicast Receiver
+;; Multicast Receiver (read-only)
 ;; =============================================================================
 
 (defrecord MulticastTransport [^MulticastSocket socket ^InetAddress group
@@ -100,10 +140,7 @@
         (.receive socket pkt)
         (let [data (byte-array (.getLength pkt))]
           (System/arraycopy (.getData pkt) 0 data 0 (.getLength pkt))
-          (when (>= (alength data) 4)
-            (let [payload (byte-array (- (alength data) 4))]
-              (System/arraycopy data 4 payload 0 (alength payload))
-              (proto/decode-payload payload)))))))
+          (proto/decode-auto data)))))
   
   (close! [_]
     (reset! running? false)

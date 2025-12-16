@@ -1,0 +1,12 @@
+{
+  "name": "matching-engine-clojure-client",
+  "version": "1.0.0",
+  "scripts": {
+    "dev": "shadow-cljs watch app",
+    "release": "shadow-cljs release app",
+    "clean": "rm -rf resources/public/js"
+  },
+  "devDependencies": {
+    "shadow-cljs": "2.26.0"
+  }
+}
