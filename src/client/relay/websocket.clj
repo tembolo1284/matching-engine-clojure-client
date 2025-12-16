@@ -1,12 +1,37 @@
 (ns client.relay.websocket
   "WebSocket server for browser clients."
-  (:require [clojure.data.json :as json]
-            [clojure.java.io :as io])
+  (:require [clojure.java.io :as io]
+            [clojure.string :as str])
   (:import [java.net ServerSocket Socket]
            [java.io BufferedReader InputStreamReader OutputStream BufferedInputStream]
            [java.security MessageDigest]
            [java.util Base64]
            [java.util.concurrent ConcurrentHashMap]))
+
+;; =============================================================================
+;; Simple JSON Encoding (no external deps)
+;; =============================================================================
+
+(defn- json-str [v]
+  (cond
+    (nil? v) "null"
+    (string? v) (str "\"" (-> v
+                              (str/replace "\\" "\\\\")
+                              (str/replace "\"" "\\\"")
+                              (str/replace "\n" "\\n")
+                              (str/replace "\r" "\\r")
+                              (str/replace "\t" "\\t")) "\"")
+    (keyword? v) (json-str (name v))
+    (number? v) (str v)
+    (boolean? v) (if v "true" "false")
+    (map? v) (str "{"
+                  (str/join "," (map (fn [[k v]]
+                                       (str (json-str (if (keyword? k) (name k) (str k)))
+                                            ":" (json-str v)))
+                                     v))
+                  "}")
+    (sequential? v) (str "[" (str/join "," (map json-str v)) "]")
+    :else (json-str (str v))))
 
 ;; =============================================================================
 ;; State
@@ -34,8 +59,8 @@
         (let [line (.readLine reader)]
           (if (or (nil? line) (empty? line))
             {:request-line request-line :headers headers}
-            (let [[k v] (clojure.string/split line #": " 2)]
-              (recur (assoc headers (clojure.string/lower-case k) v)))))))))
+            (let [[k v] (str/split line #": " 2)]
+              (recur (assoc headers (str/lower-case k) v)))))))))
 
 (defn- send-handshake-response [^OutputStream out accept-key]
   (let [response (str "HTTP/1.1 101 Switching Protocols\r\n"
@@ -53,9 +78,7 @@
 (defn- send-ws-frame [^OutputStream out ^String text]
   (let [payload (.getBytes text "UTF-8")
         len (alength payload)]
-    ;; Text frame opcode
     (.write out 0x81)
-    ;; Length
     (cond
       (< len 126)
       (.write out len)
@@ -78,8 +101,7 @@
 (defn- read-ws-frame [^BufferedInputStream in]
   (let [b1 (.read in)]
     (when (not= b1 -1)
-      (let [_fin (bit-and b1 0x80)
-            opcode (bit-and b1 0x0F)
+      (let [opcode (bit-and b1 0x0F)
             b2 (.read in)
             masked (pos? (bit-and b2 0x80))
             len1 (bit-and b2 0x7F)
@@ -104,12 +126,12 @@
 
 (defn- content-type [path]
   (cond
-    (clojure.string/ends-with? path ".html") "text/html"
-    (clojure.string/ends-with? path ".css") "text/css"
-    (clojure.string/ends-with? path ".js") "application/javascript"
-    (clojure.string/ends-with? path ".json") "application/json"
-    (clojure.string/ends-with? path ".png") "image/png"
-    (clojure.string/ends-with? path ".ico") "image/x-icon"
+    (str/ends-with? path ".html") "text/html; charset=utf-8"
+    (str/ends-with? path ".css") "text/css"
+    (str/ends-with? path ".js") "application/javascript"
+    (str/ends-with? path ".json") "application/json"
+    (str/ends-with? path ".png") "image/png"
+    (str/ends-with? path ".ico") "image/x-icon"
     :else "text/plain"))
 
 (defn- serve-static [^OutputStream out path]
@@ -117,12 +139,13 @@
         resource (io/resource (str "public" resource-path))]
     (if resource
       (let [content (slurp resource)
+            bytes (.getBytes content "UTF-8")
             response (str "HTTP/1.1 200 OK\r\n"
                           "Content-Type: " (content-type resource-path) "\r\n"
-                          "Content-Length: " (count (.getBytes content "UTF-8")) "\r\n"
-                          "\r\n"
-                          content)]
-        (.write out (.getBytes response "UTF-8")))
+                          "Content-Length: " (alength bytes) "\r\n"
+                          "\r\n")]
+        (.write out (.getBytes response))
+        (.write out bytes))
       (let [response "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nNot Found"]
         (.write out (.getBytes response))))
     (.flush out)))
@@ -140,7 +163,6 @@
       (when-let [{:keys [request-line headers]} (parse-http-request reader)]
         (let [[_ path] (re-find #"GET ([^ ]+)" request-line)]
           (if (= path "/ws")
-            ;; WebSocket upgrade
             (when-let [ws-key (get headers "sec-websocket-key")]
               (let [accept-key (compute-accept-key ws-key)]
                 (send-handshake-response out accept-key)
@@ -148,18 +170,14 @@
                 (println (format "[info] Client connected: %s (total: %d)" 
                                  client-id (.size clients)))
                 
-                ;; Read loop
                 (loop []
                   (when-let [{:keys [opcode payload]} (read-ws-frame in)]
                     (case opcode
-                      8 nil  ; Close
-                      9 (do  ; Ping -> Pong
-                          (send-ws-frame out payload)
-                          (recur))
-                      10 (recur)  ; Pong - ignore
+                      8 nil
+                      9 (do (send-ws-frame out payload) (recur))
+                      10 (recur)
                       (recur))))))
             
-            ;; Regular HTTP - serve static
             (serve-static out path))))
       
       (catch Exception e
@@ -180,7 +198,7 @@
 (defn broadcast!
   "Send message to all connected WebSocket clients."
   [msg]
-  (let [json-msg (if (string? msg) msg (json/write-str msg))]
+  (let [json-msg (if (string? msg) msg (json-str msg))]
     (doseq [[client-id {:keys [out]}] clients]
       (try
         (send-ws-frame out json-msg)
@@ -203,9 +221,7 @@
         (try
           (let [client (.accept ss)]
             (future (handle-client client)))
-          (catch java.net.SocketException _
-            ;; Server closed
-            )
+          (catch java.net.SocketException _)
           (catch Exception e
             (when @running
               (println "[error] Accept error:" (.getMessage e)))))))))
