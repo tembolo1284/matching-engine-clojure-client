@@ -50,6 +50,9 @@
 ;; Message Reading
 ;; =============================================================================
 
+(defn- bytes->hex [^bytes bs]
+  (apply str (map #(format "%02X " (bit-and % 0xFF)) bs)))
+
 (defn- read-multicast-message! [^MulticastSocket socket]
   (let [buf (byte-array 1024)
         pkt (DatagramPacket. buf (alength buf))]
@@ -57,9 +60,13 @@
     (let [len (.getLength pkt)
           data (byte-array len)]
       (System/arraycopy (.getData pkt) 0 data 0 len)
+      ;; DEBUG: Print raw data
+      (println (format "[debug] Received %d bytes: %s" len (bytes->hex data)))
       ;; Decode the message
       (try
-        (proto/decode-output-bytes data)
+        (let [msg (proto/decode-output-bytes data)]
+          (println (format "[debug] Decoded: %s" msg))
+          msg)
         (catch Exception e
           (println "[warn] Failed to decode:" (.getMessage e))
           nil)))))
@@ -76,7 +83,10 @@
       (while @running
         (try
           (when-let [msg (read-multicast-message! socket)]
+            (println (format "[debug] Message type: %s, filter: %s, pass: %s" 
+                            (:type msg) filter-set (contains? filter-set (:type msg))))
             (when (or (nil? filter-set) (contains? filter-set (:type msg)))
+              (println "[debug] Broadcasting to WebSocket clients...")
               (broadcast! msg)))
           (catch SocketTimeoutException _
             ;; Normal timeout, continue
@@ -98,7 +108,6 @@
     (let [socket (join-multicast! config)]
       (start-reader! socket message-filter))
     
-    ;; For now, only multicast is fully supported for relay
     (println "[warn] Only multicast transport is supported for relay. Use -m GROUP:PORT")))
 
 (defn stop! []
