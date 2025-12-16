@@ -1,571 +1,554 @@
-(ns client.scenarios
-  "Test scenarios for the matching engine client.
-   Mirrors the Zig scenarios.zig functionality.
-   
-   Usage:
-     (run! conn 1)      ; Simple orders
-     (run! conn 2)      ; Matching trade
-     (run! conn 20)     ; 1K matching stress
-     (list-scenarios)   ; Show available scenarios"
-  (:refer-clojure :exclude [run!])
-  (:require [client.client :as client]
-            [client.protocol :as proto]))
+(ns client.core
+  "Interactive REPL client for the matching engine.
+
+   Provides a friendly interface for sending orders and viewing responses.
+   Uses shared protocol and transport modules."
+  (:require [client.protocol :as proto]
+            [client.transport :as transport])
+  (:gen-class))
 
 ;; =============================================================================
-;; Configuration
+;; State
 ;; =============================================================================
 
-(def ^:dynamic *quiet* false)
-(def ^:dynamic *progress-fn* println)
+(defonce ^:private state
+  (atom {:transport nil
+         :reader-thread nil
+         :user-id 1
+         :next-order-id 1
+         :history []
+         :message-count (atom 0)}))
 
-(defmacro with-quiet [& body]
-  `(binding [*quiet* true] ~@body))
+(defn- next-order-id! []
+  (let [id (:next-order-id @state)]
+    (swap! state update :next-order-id inc)
+    id))
 
-;; =============================================================================
-;; Response Statistics
-;; =============================================================================
+(defn- reset-order-id! []
+  (swap! state assoc :next-order-id 1))
 
-(defn make-stats []
-  {:acks (atom 0)
-   :cancel-acks (atom 0)
-   :trades (atom 0)
-   :top-of-book (atom 0)
-   :rejects (atom 0)
-   :parse-errors (atom 0)})
+(defn- add-to-history! [msg]
+  (swap! state update :history
+         (fn [h]
+           (let [h' (conj h msg)]
+             (if (> (count h') 100)
+               (subvec h' (- (count h') 100))
+               h')))))
 
-(defn stats-total [stats]
-  (+ @(:acks stats)
-     @(:cancel-acks stats)
-     @(:trades stats)
-     @(:top-of-book stats)
-     @(:rejects stats)))
-
-(defn count-message! [stats msg]
-  (case (:type msg)
-    :ack (swap! (:acks stats) inc)
-    :cancel-ack (swap! (:cancel-acks stats) inc)
-    :trade (swap! (:trades stats) inc)
-    :top-of-book (swap! (:top-of-book stats) inc)
-    :reject (swap! (:rejects stats) inc)
-    :parse-error (swap! (:parse-errors stats) inc)
-    nil))
-
-(defn merge-stats! [target source]
-  (swap! (:acks target) + @(:acks source))
-  (swap! (:cancel-acks target) + @(:cancel-acks source))
-  (swap! (:trades target) + @(:trades source))
-  (swap! (:top-of-book target) + @(:top-of-book source))
-  (swap! (:rejects target) + @(:rejects source))
-  (swap! (:parse-errors target) + @(:parse-errors source)))
-
-(defn print-stats [stats]
-  (println "\n=== Server Response Summary ===")
-  (println (format "ACKs:            %d" @(:acks stats)))
-  (when (pos? @(:cancel-acks stats))
-    (println (format "Cancel ACKs:     %d" @(:cancel-acks stats))))
-  (when (pos? @(:trades stats))
-    (println (format "Trades:          %d" @(:trades stats))))
-  (println (format "Top of Book:     %d" @(:top-of-book stats)))
-  (when (pos? @(:rejects stats))
-    (println (format "Rejects:         %d" @(:rejects stats))))
-  (when (pos? @(:parse-errors stats))
-    (println (format "Parse errors:    %d" @(:parse-errors stats))))
-  (println (format "Total messages:  %d" (stats-total stats))))
-
-(defn print-validation [stats expected-acks expected-trades]
-  (print-stats stats)
-  (println "\n=== Validation ===")
-  
-  (let [actual-acks @(:acks stats)
-        actual-trades @(:trades stats)]
-    (if (>= actual-acks expected-acks)
-      (println (format "ACKs:            %d/%d ✓ PASS" actual-acks expected-acks))
-      (let [pct (if (pos? expected-acks) (quot (* actual-acks 100) expected-acks) 0)]
-        (println (format "ACKs:            %d/%d (%d%%) ✗ MISSING %d"
-                         actual-acks expected-acks pct (- expected-acks actual-acks)))))
-    
-    (when (pos? expected-trades)
-      (if (>= actual-trades expected-trades)
-        (println (format "Trades:          %d/%d ✓ PASS" actual-trades expected-trades))
-        (let [pct (if (pos? expected-trades) (quot (* actual-trades 100) expected-trades) 0)]
-          (println (format "Trades:          %d/%d (%d%%) ✗ MISSING %d"
-                           actual-trades expected-trades pct (- expected-trades actual-trades))))))
-    
-    (let [passed (and (>= actual-acks expected-acks)
-                      (or (zero? expected-trades) (>= actual-trades expected-trades)))]
-      (cond
-        (pos? @(:rejects stats))
-        (println (format "\n*** TEST FAILED - %d REJECTS ***" @(:rejects stats)))
-        
-        passed
-        (println "\n*** TEST PASSED ***")
-        
-        :else
-        (println "\n*** TEST FAILED - MISSING RESPONSES ***"))
-      
-      passed)))
+(defn- print-msg [msg]
+  (println (str "  [RECV] " (proto/format-message msg)))
+  (add-to-history! msg)
+  (when-let [counter (:message-count @state)]
+    (swap! counter inc)))
 
 ;; =============================================================================
-;; Response Handling
+;; Connection Management
 ;; =============================================================================
 
-(defn drain-responses
-  "Drain all pending responses with timeout."
-  [conn timeout-ms]
-  (let [stats (make-stats)
-        start (System/currentTimeMillis)
-        poll-timeout 100
-        max-empty 100]
-    (loop [consecutive-empty 0]
-      (let [elapsed (- (System/currentTimeMillis) start)]
-        (if (or (>= elapsed timeout-ms)
-                (>= consecutive-empty max-empty))
-          stats
-          (if-let [msg (client/recv-message conn poll-timeout)]
-            (do
-              (count-message! stats msg)
-              (recur 0))
-            (recur (inc consecutive-empty))))))))
+(defn start!
+  "Connect to matching engine.
 
-(defn recv-and-count!
-  "Try to receive a message and count it."
-  [conn stats timeout-ms]
-  (when-let [msg (client/recv-message conn timeout-ms)]
-    (count-message! stats msg)
-    msg))
+   Examples:
+     (start!)                       ; localhost:1234 TCP
+     (start! 9000)                  ; localhost:9000
+     (start! \"host\" 1234)         ; custom host
+     (start! {:transport :udp})     ; UDP transport"
+  ([] (start! "localhost" 1234 {}))
+  ([arg]
+   (cond
+     (number? arg) (start! "localhost" arg {})
+     (map? arg) (start! "localhost" 1234 arg)
+     (string? arg) (start! arg 1234 {})
+     :else (start!)))
+  ([host port] (start! host port {}))
+  ([host port opts]
+   (when-let [old (:transport @state)]
+     (transport/close! old))
 
-(defn recv-and-print-responses [conn]
-  (Thread/sleep 50)
-  (doseq [msg (client/recv-all conn 100)]
-    (println (str "  [RECV] " (proto/format-message msg)))))
+   (let [transport-type (or (:transport opts) :tcp)
+         tp (transport/connect transport-type host port)
+         msg-counter (atom 0)]
+     (swap! state assoc :transport tp :message-count msg-counter)
+     (println (format "Connected to %s:%d via %s" host port (name transport-type)))
+
+     ;; Start reader thread
+     (let [thread (Thread.
+                   ^Runnable
+                   (fn []
+                     (while (and (:transport @state)
+                                 (transport/connected? tp))
+                       (try
+                         (when-let [msg (transport/recv-msg! tp)]
+                           (print-msg msg))
+                         (catch java.net.SocketTimeoutException _)
+                         (catch Exception e
+                           (when (transport/connected? tp)
+                             (println "Reader error:" (.getMessage e))))))))]
+       (.setDaemon thread true)
+       (.setName thread "client-reader")
+       (.start thread)
+       (swap! state assoc :reader-thread thread)))
+
+   :connected))
+
+(defn stop!
+  "Disconnect from matching engine."
+  []
+  (when-let [tp (:transport @state)]
+    (transport/close! tp)
+    (swap! state assoc :transport nil :reader-thread nil)
+    (println "Disconnected"))
+  :disconnected)
+
+(defn status
+  "Show connection status."
+  []
+  (if-let [tp (:transport @state)]
+    (if (transport/connected? tp)
+      (println "Connected")
+      (println "Disconnected (stale)"))
+    (println "Not connected")))
 
 ;; =============================================================================
-;; Formatting Helpers
+;; Order Commands
 ;; =============================================================================
 
-(defn format-time [ms]
-  (cond
-    (>= ms 60000) (format "%dm %ds" (quot ms 60000) (rem (quot ms 1000) 60))
-    (>= ms 1000)  (format "%.3f sec" (/ ms 1000.0))
-    :else         (format "%d ms" ms)))
+(defn- send-order! [side symbol price qty]
+  (when-let [tp (:transport @state)]
+    (let [order {:type :new-order
+                 :user-id (:user-id @state)
+                 :order-id (next-order-id!)
+                 :side side
+                 :symbol symbol
+                 :price price
+                 :qty qty}]
+      (transport/send-msg! tp order)
+      (:order-id order))))
 
-(defn format-rate [rate]
+(defn buy
+  "Send a buy order."
+  [symbol price qty]
+  (let [oid (send-order! :buy symbol price qty)]
+    (println (format "Sent BUY %s %d @ %.2f (order #%d)" symbol qty price oid))
+    oid))
+
+(defn sell
+  "Send a sell order."
+  [symbol price qty]
+  (let [oid (send-order! :sell symbol price qty)]
+    (println (format "Sent SELL %s %d @ %.2f (order #%d)" symbol qty price oid))
+    oid))
+
+(defn cancel
+  "Cancel an order."
+  [symbol order-id]
+  (when-let [tp (:transport @state)]
+    (let [msg {:type :cancel
+               :user-id (:user-id @state)
+               :order-id order-id
+               :symbol symbol}]
+      (transport/send-msg! tp msg)
+      (println (format "Sent CANCEL %s order #%d" symbol order-id)))))
+
+(defn flush!
+  "Flush all order books."
+  []
+  (when-let [tp (:transport @state)]
+    (transport/send-msg! tp {:type :flush})
+    (println "Sent FLUSH")))
+
+;; =============================================================================
+;; History
+;; =============================================================================
+
+(defn show
+  "Show recent messages."
+  ([] (show 10))
+  ([n]
+   (let [msgs (take-last n (:history @state))]
+     (if (empty? msgs)
+       (println "No messages yet")
+       (doseq [msg msgs]
+         (println (str "  " (proto/format-message msg))))))))
+
+(defn clear-history!
+  "Clear message history."
+  []
+  (swap! state assoc :history [])
+  (println "History cleared"))
+
+;; =============================================================================
+;; Timing Helpers
+;; =============================================================================
+
+(defn- drain-responses
+  "Wait for responses to arrive. Returns count of messages received."
+  [timeout-ms]
+  (let [start-count @(:message-count @state)]
+    (Thread/sleep timeout-ms)
+    (- @(:message-count @state) start-count)))
+
+(defn- format-rate [rate]
   (cond
     (>= rate 1000000) (format "%.2fM/sec" (/ rate 1000000.0))
     (>= rate 1000)    (format "%.1fK/sec" (/ rate 1000.0))
-    :else             (format "%d/sec" rate)))
+    :else             (format "%.0f/sec" (double rate))))
 
-(defn format-count [n]
+(defn- format-time [ms]
   (cond
-    (>= n 1000000) (format "%dM" (quot n 1000000))
-    (>= n 1000)    (format "%dK" (quot n 1000))
+    (>= ms 60000) (format "%dm %ds" (quot ms 60000) (rem (quot ms 1000) 60))
+    (>= ms 1000)  (format "%.2f sec" (/ ms 1000.0))
+    :else         (format "%d ms" ms)))
+
+(defn- format-count [n]
+  (cond
+    (>= n 1000000) (format "%.1fM" (/ n 1000000.0))
+    (>= n 1000)    (format "%.1fK" (/ n 1000.0))
     :else          (str n)))
 
 ;; =============================================================================
 ;; Basic Scenarios
 ;; =============================================================================
 
-(defn scenario-1
-  "Simple Orders - two non-matching orders"
-  [conn]
-  (println "=== Scenario 1: Simple Orders ===\n")
-  (client/send-order! conn 1 "IBM" 100 50 :buy 1)
-  (Thread/sleep 100)
-  (recv-and-print-responses conn)
-  (client/send-order! conn 1 "IBM" 105 50 :sell 2)
-  (Thread/sleep 100)
-  (recv-and-print-responses conn)
-  (println "\n[FLUSH] Cleaning up server state")
-  (client/send-flush! conn)
-  (Thread/sleep 100)
-  (recv-and-print-responses conn))
-
-(defn scenario-2
-  "Matching Trade - buy and sell at same price"
-  [conn]
-  (println "=== Scenario 2: Matching Trade ===\n")
-  (client/send-order! conn 1 "IBM" 100 50 :buy 1)
-  (Thread/sleep 75)
-  (recv-and-print-responses conn)
-  (client/send-order! conn 1 "IBM" 100 50 :sell 2)
-  (Thread/sleep 75)
-  (recv-and-print-responses conn)
-  (println "\n[FLUSH] Cleaning up server state")
-  (client/send-flush! conn)
-  (Thread/sleep 100)
-  (recv-and-print-responses conn))
-
-(defn scenario-3
-  "Cancel Order - place then cancel"
-  [conn]
-  (println "=== Scenario 3: Cancel Order ===\n")
-  (client/send-order! conn 1 "IBM" 100 50 :buy 1)
-  (Thread/sleep 100)
-  (recv-and-print-responses conn)
-  (client/send-cancel! conn 1 "IBM" 1)
-  (Thread/sleep 100)
-  (recv-and-print-responses conn)
-  (println "\n[FLUSH] Cleaning up server state")
-  (client/send-flush! conn)
-  (Thread/sleep 100)
-  (recv-and-print-responses conn))
-
-;; =============================================================================
-;; Unmatched Stress Test
-;; =============================================================================
-
-(defn stress-test
-  "Send many non-matching orders."
-  [conn count]
-  (println (format "=== Unmatched Stress: %s Orders ===\n" (format-count count)))
+(defn- scenario-simple-orders
+  "Scenario 1: Simple orders (no match)"
+  []
+  (println "\n=== Scenario 1: Simple Orders ===\n")
+  (reset-order-id!)
   
-  (client/send-flush! conn)
-  (Thread/sleep 200)
-  (drain-responses conn 500)
+  (println "Sending: BUY IBM 50@100")
+  (send-order! :buy "IBM" 100 50)
+  (drain-responses 150)
   
-  (let [batch-size (cond (>= count 100000) 500
-                         (>= count 10000) 200
-                         :else 100)
-        delay-ms (cond (>= count 100000) 10
-                       (>= count 10000) 5
-                       :else 2)
-        progress-interval (max 1 (quot count 10))
-        start (System/currentTimeMillis)
-        send-errors (atom 0)]
+  (println "\nSending: SELL IBM 50@105")
+  (send-order! :sell "IBM" 105 50)
+  (drain-responses 150)
+  
+  (println "\nSending: FLUSH")
+  (flush!)
+  (drain-responses 250)
+  
+  (println "\n*** Scenario 1 Complete ***"))
+
+(defn- scenario-matching-trade
+  "Scenario 2: Matching trade execution"
+  []
+  (println "\n=== Scenario 2: Matching Trade ===\n")
+  (reset-order-id!)
+  
+  (println "Sending: BUY IBM 50@100")
+  (send-order! :buy "IBM" 100 50)
+  (drain-responses 150)
+  
+  (println "\nSending: SELL IBM 50@100 (should match!)")
+  (send-order! :sell "IBM" 100 50)
+  (drain-responses 200)
+  
+  (println "\n*** Scenario 2 Complete ***"))
+
+(defn- scenario-cancel-order
+  "Scenario 3: Cancel order"
+  []
+  (println "\n=== Scenario 3: Cancel Order ===\n")
+  (reset-order-id!)
+  
+  (println "Sending: BUY IBM 50@100")
+  (let [oid (send-order! :buy "IBM" 100 50)]
+    (drain-responses 150)
     
-    (when-not *quiet*
-      (println (format "Throttle: %d/batch, %dms delay" batch-size delay-ms)))
+    (println (format "\nSending: CANCEL order %d" oid))
+    (cancel "IBM" oid)
+    (drain-responses 150))
+  
+  (println "\n*** Scenario 3 Complete ***"))
+
+;; =============================================================================
+;; Stress Test (Non-Matching)
+;; =============================================================================
+
+(defn- scenario-stress-test
+  "Stress test: non-matching orders"
+  [count]
+  (println (format "\n=== Stress Test: %s Orders (non-matching) ===\n" (format-count count)))
+  (reset-order-id!)
+  
+  ;; Flush first
+  (flush!)
+  (drain-responses 200)
+  
+  (let [progress-interval (max 1 (quot count 20))
+        start-time (System/currentTimeMillis)
+        sent (atom 0)]
     
     (dotimes [i count]
       (let [price (+ 100 (mod i 100))]
-        (try
-          (client/send-order! conn 1 "IBM" price 10 :buy (inc i))
-          (catch Exception _ (swap! send-errors inc))))
+        (send-order! :buy "IBM" price 10)
+        (swap! sent inc))
       
-      (when (and (not *quiet*)
-                 (pos? i)
-                 (zero? (mod i progress-interval)))
-        (println (format "  %d%%" (quot (* i 100) count))))
+      ;; Progress every 5%
+      (when (and (pos? i) (zero? (mod i progress-interval)))
+        (let [elapsed (- (System/currentTimeMillis) start-time)
+              pct (quot (* i 100) count)
+              rate (if (pos? elapsed) (quot (* @sent 1000) elapsed) 0)]
+          (println (format "  %d%% (%d orders, %s, %s)"
+                          pct @sent (format-time elapsed) (format-rate rate)))))
       
-      (when (and (pos? i) (zero? (mod i batch-size)))
-        (Thread/sleep delay-ms)))
+      ;; Small delay every 100 orders to let reader thread work
+      (when (zero? (mod i 100))
+        (Thread/sleep 1)))
     
-    (let [end (System/currentTimeMillis)
-          total-time (- end start)
-          sent (- count @send-errors)]
+    (let [elapsed (- (System/currentTimeMillis) start-time)]
+      (println (format "\nSent %d orders in %s" @sent (format-time elapsed)))
+      (println "Waiting for responses...")
+      (drain-responses 2000)
       
-      (println "\n=== Send Results ===")
-      (println (format "Orders sent:     %d" sent))
-      (println (format "Send errors:     %d" @send-errors))
-      (println (format "Total time:      %s" (format-time total-time)))
+      (println "\nSending FLUSH...")
+      (flush!)
+      (drain-responses 2000)
       
-      (println "\nDraining responses...")
-      (let [stats (drain-responses conn 15000)]
-        (print-validation stats sent 0))))
-  
-  (println "\n[FLUSH] Cleaning up server state")
-  (client/send-flush! conn)
-  (Thread/sleep 200))
+      (println "\n*** Stress Test Complete ***"))))
 
 ;; =============================================================================
 ;; Matching Stress Test (Single Symbol)
 ;; =============================================================================
 
-(defn matching-stress
-  "Send matching buy/sell pairs to generate trades."
-  [conn trades]
-  (let [orders (* trades 2)]
-    (if (>= trades 100000000)
-      (do
-        (println)
-        (println "╔══════════════════════════════════════════════════════════╗")
-        (println (format "║  ★★★ LEGENDARY MATCHING STRESS TEST ★★★                  ║"))
-        (println (format "║  %sM TRADES (%sM ORDERS)                              ║"
-                         (quot trades 1000000) (quot orders 1000000)))
-        (println "╚══════════════════════════════════════════════════════════╝")
-        (println))
-      (println (format "=== Matching Stress Test: %s Trades ===\n" (format-count trades))))
-    
-    (println (format "Target: %s trades (%s orders)" (format-count trades) (format-count orders)))
-    
-    (client/send-flush! conn)
-    (Thread/sleep 200)
-    (drain-responses conn 500)
-    
-    (let [pairs-per-batch (cond (>= trades 100000000) 100
-                                (>= trades 1000000) 100
-                                (>= trades 100000) 100
-                                (>= trades 10000) 50
-                                :else 50)
-          delay-ms (cond (>= trades 100000000) 50
-                         (>= trades 1000000) 50
-                         (>= trades 100000) 30
-                         (>= trades 10000) 20
-                         :else 10)
-          progress-pct (if (>= trades 1000000) 5 10)
-          progress-interval (max 1 (quot trades (quot 100 progress-pct)))
-          
-          start (System/currentTimeMillis)
-          send-errors (atom 0)
-          pairs-sent (atom 0)
-          running-stats (make-stats)]
-      
-      (println (format "Throttling: %d pairs/batch, %dms delay (interleaved recv)"
-                       pairs-per-batch delay-ms))
-      
-      (dotimes [i trades]
-        (let [price (+ 100 (mod i 50))
-              buy-oid (inc (* i 2))
-              sell-oid (+ 2 (* i 2))]
-          (try
-            (client/send-order! conn 1 "IBM" price 10 :buy buy-oid)
-            (client/send-order! conn 1 "IBM" price 10 :sell sell-oid)
-            (swap! pairs-sent inc)
-            (catch Exception _ (swap! send-errors inc))))
-        
-        (when (and (not *quiet*)
-                   (pos? i)
-                   (> (quot i progress-interval) (quot (dec i) progress-interval)))
-          (let [elapsed (- (System/currentTimeMillis) start)
-                rate (if (pos? elapsed) (quot (* @pairs-sent 1000) elapsed) 0)]
-            (println (format "  %d%% | %d pairs | %d ms | %d trades/sec | recv'd: %d"
-                             (quot (* i 100) trades)
-                             @pairs-sent
-                             elapsed
-                             rate
-                             (stats-total running-stats)))))
-        
-        (when (and (pos? i) (zero? (mod i pairs-per-batch)))
-          ;; Drain aggressively
-          (let [drain-target (* pairs-per-batch 5)]
-            (dotimes [_ drain-target]
-              (when-let [msg (client/recv-message conn 1)]
-                (count-message! running-stats msg))))
-          (Thread/sleep delay-ms)))
-      
-      (let [end (System/currentTimeMillis)
-            total-time (- end start)
-            orders-sent (* @pairs-sent 2)]
-        
-        (println "\n=== Send Results ===")
-        (println (format "Trade pairs:     %d" @pairs-sent))
-        (println (format "Orders sent:     %d" orders-sent))
-        (println (format "Send errors:     %d" @send-errors))
-        (println (format "Total time:      %s" (format-time total-time)))
-        
-        (when (pos? total-time)
-          (let [throughput (quot (* orders-sent 1000) total-time)
-                trade-rate (quot (* @pairs-sent 1000) total-time)]
-            (println "\n=== Throughput ===")
-            (println (format "Orders/sec:      %s" (format-rate throughput)))
-            (println (format "Trades/sec:      %s" (format-rate trade-rate)))))
-        
-        (println (format "\nReceived during send: %d messages" (stats-total running-stats)))
-        
-        (println "Waiting for TCP buffers to flush...")
-        (Thread/sleep 3000)
-        
-        (let [expected-acks orders-sent
-              expected-trades @pairs-sent
-              expected-total (+ expected-acks expected-trades (* expected-trades 2))
-              remaining (- expected-total (stats-total running-stats))
-              drain-timeout (cond (>= trades 100000000) 1800000
-                                  (>= trades 1000000) 600000
-                                  (>= trades 500000) 300000
-                                  (>= trades 250000) 180000
-                                  (>= trades 100000) 120000
-                                  :else 60000)]
-          
-          (println (format "Final drain (expecting ~%d more)..." remaining))
-          (let [final-stats (drain-responses conn drain-timeout)]
-            (merge-stats! running-stats final-stats)
-            
-            (let [passed (print-validation running-stats expected-acks expected-trades)]
-              (when (and (>= trades 100000000) 
-                         (>= @(:trades running-stats) expected-trades))
-                (println)
-                (println "╔══════════════════════════════════════════════════════════╗")
-                (println "║  ★★★ LEGENDARY ACHIEVEMENT UNLOCKED ★★★                  ║")
-                (println "╚══════════════════════════════════════════════════════════╝"))
-              
-              passed))))))
+(defn- scenario-matching-stress
+  "Matching stress: buy/sell pairs that generate trades"
+  [pairs]
+  (println (format "\n=== Matching Stress: %s Trade Pairs ===\n" (format-count pairs)))
+  (println (format "Target: %s trades (%s orders)\n" (format-count pairs) (format-count (* pairs 2))))
+  (reset-order-id!)
   
-  (println "\n[FLUSH] Cleaning up server state")
-  (client/send-flush! conn)
-  (Thread/sleep 2000))
+  ;; Flush first
+  (flush!)
+  (drain-responses 200)
+  
+  (let [progress-interval (max 1 (quot pairs 20))
+        batch-size (cond (>= pairs 100000) 100
+                        (>= pairs 10000) 50
+                        :else 25)
+        start-time (System/currentTimeMillis)
+        pairs-sent (atom 0)]
+    
+    (dotimes [i pairs]
+      (let [price (+ 100 (mod i 50))]
+        ;; Buy order
+        (send-order! :buy "IBM" price 10)
+        ;; Matching sell order
+        (send-order! :sell "IBM" price 10)
+        (swap! pairs-sent inc))
+      
+      ;; Progress every 5%
+      (when (and (pos? i) (zero? (mod i progress-interval)))
+        (let [elapsed (- (System/currentTimeMillis) start-time)
+              pct (quot (* i 100) pairs)
+              rate (if (pos? elapsed) (quot (* @pairs-sent 1000) elapsed) 0)]
+          (println (format "  %d%% | %d pairs | %s | %s trades/sec"
+                          pct @pairs-sent (format-time elapsed) (format-rate rate)))))
+      
+      ;; Interleaved delay - let reader thread process responses
+      (when (zero? (mod i batch-size))
+        (Thread/sleep 5)))
+    
+    (let [elapsed (- (System/currentTimeMillis) start-time)
+          orders-sent (* @pairs-sent 2)]
+      (println (format "\n=== Send Complete ==="))
+      (println (format "Trade pairs:  %d" @pairs-sent))
+      (println (format "Orders sent:  %d" orders-sent))
+      (println (format "Send time:    %s" (format-time elapsed)))
+      (when (pos? elapsed)
+        (println (format "Send rate:    %s orders/sec" (format-rate (quot (* orders-sent 1000) elapsed)))))
+      
+      ;; Wait for server to finish processing
+      (let [wait-ms (cond (>= pairs 100000) 5000
+                         (>= pairs 10000) 2000
+                         :else 1000)]
+        (println (format "\nWaiting %d ms for server to finish..." wait-ms))
+        (drain-responses wait-ms))
+      
+      (println "\n*** Matching Stress Complete ***"))))
 
 ;; =============================================================================
 ;; Dual-Processor Stress Test (IBM + NVDA)
 ;; =============================================================================
 
-(defn dual-processor-stress
-  "Send matching pairs to two symbols (for dual-processor engines)."
-  [conn trades]
-  (let [orders (* trades 2)
-        trades-per-proc (quot trades 2)]
+(defn- scenario-dual-processor-stress
+  "Dual-processor stress: matching pairs across two symbols"
+  [pairs]
+  (let [symbols ["IBM" "NVDA"]]
+    (println "\n============================================================")
+    (println "  DUAL-PROCESSOR MATCHING STRESS TEST")
+    (println "============================================================")
+    (println (format "Trade Pairs:     %s" (format-count pairs)))
+    (println (format "Total Orders:    %s" (format-count (* pairs 2))))
+    (println (format "Processor 0:     IBM  (%s trades)" (format-count (quot pairs 2))))
+    (println (format "Processor 1:     NVDA (%s trades)" (format-count (quot pairs 2))))
+    (println "============================================================\n")
+    (reset-order-id!)
     
-    (if (>= trades 10000000)
-      (do
-        (println)
-        (println "╔══════════════════════════════════════════════════════════╗")
-        (println "║  ★★★ DUAL-PROCESSOR STRESS TEST ★★★                      ║")
-        (println (format "║  %sM TRADES (%sM ORDERS)                              ║"
-                         (quot trades 1000000) (quot orders 1000000)))
-        (println (format "║  Processor 0 (A-M): IBM  - %sM trades                   ║"
-                         (quot trades-per-proc 1000000)))
-        (println (format "║  Processor 1 (N-Z): NVDA - %sM trades                   ║"
-                         (quot trades-per-proc 1000000)))
-        (println "╚══════════════════════════════════════════════════════════╝")
-        (println))
-      (println (format "=== Dual-Processor Stress: %s Trades ===\n" (format-count trades))))
+    ;; Flush first
+    (flush!)
+    (drain-responses 200)
     
-    (println (format "Target: %s trades (%s orders)" (format-count trades) (format-count orders)))
-    (println (format "  Processor 0 (A-M): IBM  - %s trades" (format-count trades-per-proc)))
-    (println (format "  Processor 1 (N-Z): NVDA - %s trades" (format-count trades-per-proc)))
-    
-    (client/send-flush! conn)
-    (Thread/sleep 200)
-    (drain-responses conn 500)
-    
-    (let [symbols ["IBM" "NVDA"]
-          pairs-per-batch (cond (>= trades 10000000) 100
-                                (>= trades 1000000) 100
-                                :else 50)
-          delay-ms (cond (>= trades 10000000) 50
-                         (>= trades 1000000) 50
-                         :else 20)
-          progress-pct (if (>= trades 1000000) 5 10)
-          progress-interval (max 1 (quot trades (quot 100 progress-pct)))
-          
-          start (System/currentTimeMillis)
-          send-errors (atom 0)
-          pairs-sent (atom 0)
-          running-stats (make-stats)]
+    (let [progress-interval (max 1 (quot pairs 20))
+          batch-size (cond (>= pairs 100000) 100
+                          (>= pairs 10000) 50
+                          :else 25)
+          start-time (System/currentTimeMillis)
+          pairs-sent (atom 0)]
       
-      (println (format "Throttling: %d pairs/batch, %dms delay (interleaved recv)"
-                       pairs-per-batch delay-ms))
-      
-      (dotimes [i trades]
+      (dotimes [i pairs]
         (let [symbol (nth symbols (mod i 2))
-              price (+ 100 (mod i 50))
-              buy-oid (inc (* i 2))
-              sell-oid (+ 2 (* i 2))]
-          (try
-            (client/send-order! conn 1 symbol price 10 :buy buy-oid)
-            (client/send-order! conn 1 symbol price 10 :sell sell-oid)
-            (swap! pairs-sent inc)
-            (catch Exception _ (swap! send-errors inc))))
+              price (+ 100 (mod i 50))]
+          ;; Buy order
+          (send-order! :buy symbol price 10)
+          ;; Matching sell order
+          (send-order! :sell symbol price 10)
+          (swap! pairs-sent inc))
         
-        (when (and (not *quiet*)
-                   (pos? i)
-                   (> (quot i progress-interval) (quot (dec i) progress-interval)))
-          (let [elapsed (- (System/currentTimeMillis) start)
+        ;; Progress every 5%
+        (when (and (pos? i) (zero? (mod i progress-interval)))
+          (let [elapsed (- (System/currentTimeMillis) start-time)
+                pct (quot (* i 100) pairs)
                 rate (if (pos? elapsed) (quot (* @pairs-sent 1000) elapsed) 0)]
-            (println (format "  %d%% | %d pairs | %d ms | %d trades/sec | recv'd: %d"
-                             (quot (* i 100) trades)
-                             @pairs-sent
-                             elapsed
-                             rate
-                             (stats-total running-stats)))))
+            (println (format "  %d%% | %d pairs | %s | %s trades/sec"
+                            pct @pairs-sent (format-time elapsed) (format-rate rate)))))
         
-        (when (and (pos? i) (zero? (mod i pairs-per-batch)))
-          (let [drain-target (* pairs-per-batch 5)]
-            (dotimes [_ drain-target]
-              (when-let [msg (client/recv-message conn 2)]
-                (count-message! running-stats msg))))
-          (Thread/sleep delay-ms)))
+        ;; Interleaved delay
+        (when (zero? (mod i batch-size))
+          (Thread/sleep 5)))
       
-      (let [end (System/currentTimeMillis)
-            total-time (- end start)
+      (let [elapsed (- (System/currentTimeMillis) start-time)
             orders-sent (* @pairs-sent 2)]
+        (println "\n============================================================")
+        (println "  SEND COMPLETE")
+        (println "============================================================")
+        (println (format "Trade pairs:  %d" @pairs-sent))
+        (println (format "Orders sent:  %d" orders-sent))
+        (println (format "Send time:    %s" (format-time elapsed)))
+        (when (pos? elapsed)
+          (println (format "Send rate:    %s orders/sec" (format-rate (quot (* orders-sent 1000) elapsed)))))
+        (println "============================================================")
         
-        (println "\n=== Send Results ===")
-        (println (format "Trade pairs:     %d" @pairs-sent))
-        (println (format "Orders sent:     %d" orders-sent))
-        (println (format "Send errors:     %d" @send-errors))
-        (println (format "Total time:      %s" (format-time total-time)))
+        ;; Wait for server to finish
+        (let [wait-ms (cond (>= pairs 100000) 5000
+                           (>= pairs 10000) 2000
+                           :else 1000)]
+          (println (format "\nWaiting %d ms for server to finish..." wait-ms))
+          (drain-responses wait-ms))
         
-        (when (pos? total-time)
-          (let [throughput (quot (* orders-sent 1000) total-time)
-                trade-rate (quot (* @pairs-sent 1000) total-time)]
-            (println "\n=== Throughput ===")
-            (println (format "Orders/sec:      %s" (format-rate throughput)))
-            (println (format "Trades/sec:      %s" (format-rate trade-rate)))))
-        
-        (println (format "\nReceived during send: %d messages" (stats-total running-stats)))
-        
-        (println "Waiting for TCP buffers to flush...")
-        (Thread/sleep 3000)
-        
-        (let [expected-acks orders-sent
-              expected-trades @pairs-sent
-              drain-timeout (cond (>= trades 10000000) 1800000
-                                  (>= trades 1000000) 600000
-                                  :else 300000)]
-          
-          (println (format "Final drain..."))
-          (let [final-stats (drain-responses conn drain-timeout)]
-            (merge-stats! running-stats final-stats)
-            
-            (let [passed (print-validation running-stats expected-acks expected-trades)]
-              (when (and (>= trades 10000000)
-                         (>= @(:trades running-stats) expected-trades))
-                (println)
-                (println "╔══════════════════════════════════════════════════════════╗")
-                (println "║  ★★★ ULTIMATE DUAL-PROCESSOR ACHIEVEMENT ★★★             ║")
-                (println "╚══════════════════════════════════════════════════════════╝"))
-              
-              passed))))))
-  
-  (println "\n[FLUSH] Cleaning up server state")
-  (client/send-flush! conn)
-  (Thread/sleep 2000))
+        (println "\n*** Dual-Processor Stress Complete ***")))))
 
 ;; =============================================================================
 ;; Scenario Registry
 ;; =============================================================================
 
-(def scenarios
-  {1  {:name "Simple Orders" :fn scenario-1}
-   2  {:name "Matching Trade" :fn scenario-2}
-   3  {:name "Cancel Order" :fn scenario-3}
-   10 {:name "Unmatched 1K" :fn #(stress-test % 1000)}
-   11 {:name "Unmatched 10K" :fn #(stress-test % 10000)}
-   12 {:name "Unmatched 100K" :fn #(stress-test % 100000)}
-   20 {:name "1K trades" :fn #(matching-stress % 1000)}
-   21 {:name "10K trades" :fn #(matching-stress % 10000)}
-   22 {:name "100K trades" :fn #(matching-stress % 100000)}
-   23 {:name "250K trades" :fn #(matching-stress % 250000)}
-   24 {:name "500K trades" :fn #(matching-stress % 500000)}
-   25 {:name "250M trades ★★★ LEGENDARY ★★★" :fn #(matching-stress % 250000000)}
-   30 {:name "Dual 500K (250K each)" :fn #(dual-processor-stress % 500000)}
-   31 {:name "Dual 1M (500K each)" :fn #(dual-processor-stress % 1000000)}
-   32 {:name "Dual 100M (50M each) ★★★ ULTIMATE ★★★" :fn #(dual-processor-stress % 100000000)}})
+(def ^:private scenarios
+  {1  {:name "Simple Orders"           :fn #(scenario-simple-orders)}
+   2  {:name "Matching Trade"          :fn #(scenario-matching-trade)}
+   3  {:name "Cancel Order"            :fn #(scenario-cancel-order)}
+   10 {:name "Stress 1K (no match)"    :fn #(scenario-stress-test 1000)}
+   11 {:name "Stress 10K (no match)"   :fn #(scenario-stress-test 10000)}
+   12 {:name "Stress 100K (no match)"  :fn #(scenario-stress-test 100000)}
+   20 {:name "Match 1K trades"         :fn #(scenario-matching-stress 1000)}
+   21 {:name "Match 10K trades"        :fn #(scenario-matching-stress 10000)}
+   22 {:name "Match 100K trades"       :fn #(scenario-matching-stress 100000)}
+   23 {:name "Match 250K trades"       :fn #(scenario-matching-stress 250000)}
+   24 {:name "Match 500K trades"       :fn #(scenario-matching-stress 500000)}
+   30 {:name "Dual 500K (250K each)"   :fn #(scenario-dual-processor-stress 500000)}
+   31 {:name "Dual 1M (500K each)"     :fn #(scenario-dual-processor-stress 1000000)}})
 
-(defn list-scenarios
-  "Print available scenarios."
+(defn scenario
+  "Run a test scenario by ID, or list all scenarios."
+  ([]
+   (println "\nAvailable scenarios:")
+   (println "\nBasic (correctness testing):")
+   (println "  1  - Simple Orders (no match)")
+   (println "  2  - Matching Trade")
+   (println "  3  - Cancel Order")
+   (println "\nStress (non-matching):")
+   (println "  10 - 1K orders")
+   (println "  11 - 10K orders")
+   (println "  12 - 100K orders")
+   (println "\nMatching (single symbol - IBM):")
+   (println "  20 - 1K trades")
+   (println "  21 - 10K trades")
+   (println "  22 - 100K trades")
+   (println "  23 - 250K trades")
+   (println "  24 - 500K trades")
+   (println "\nDual-Processor (IBM + NVDA):")
+   (println "  30 - 500K trades (250K each)")
+   (println "  31 - 1M trades (500K each)")
+   (println "\nUsage: (scenario <id>)"))
+  ([id]
+   (if-let [{:keys [name fn]} (get scenarios id)]
+     (do
+       (println (format "Running scenario %d: %s" id name))
+       (fn))
+     (do
+       (println (format "Unknown scenario: %d" id))
+       (scenario)))))
+
+;; =============================================================================
+;; Help
+;; =============================================================================
+
+(def ^:private help-text
+  "
+╔════════════════════════════════════════════════════════════╗
+║           MATCHING ENGINE CLIENT - COMMANDS                ║
+╠════════════════════════════════════════════════════════════╣
+║  (start!)                 Connect to localhost:1234        ║
+║  (start! 9000)            Connect to different port        ║
+║  (start! \"host\" 1234)     Connect to remote host           ║
+║  (start! {:transport :udp}) Use UDP transport              ║
+╠════════════════════════════════════════════════════════════╣
+║  (buy \"IBM\" 100.50 100)   Buy 100 shares @ $100.50         ║
+║  (sell \"IBM\" 100.50 100)  Sell 100 shares @ $100.50        ║
+║  (cancel \"IBM\" 1)         Cancel order #1                  ║
+║  (flush!)                 Clear all order books            ║
+╠════════════════════════════════════════════════════════════╣
+║  (scenario)               List all test scenarios          ║
+║  (scenario 1)             Simple orders (no match)         ║
+║  (scenario 2)             Matching trade                   ║
+║  (scenario 20)            1K matching trades               ║
+║  (scenario 22)            100K matching trades             ║
+╠════════════════════════════════════════════════════════════╣
+║  (show)                   Show recent messages             ║
+║  (show 20)                Show last 20 messages            ║
+║  (status)                 Show connection status           ║
+║  (stop!)                  Disconnect                       ║
+║  (help)                   Show this help                   ║
+╚════════════════════════════════════════════════════════════╝
+")
+
+(defn help
+  "Show help."
   []
-  (println "Available scenarios:")
-  (println "\nBasic: 1 (orders), 2 (trade), 3 (cancel)")
-  (println "\nUnmatched: 10 (1K), 11 (10K), 12 (100K)")
-  (println "\nMatching (single processor - IBM):")
-  (println "  20 - 1K trades")
-  (println "  21 - 10K trades")
-  (println "  22 - 100K trades")
-  (println "  23 - 250K trades")
-  (println "  24 - 500K trades")
-  (println "  25 - 250M trades ★★★ LEGENDARY ★★★")
-  (println "\nDual-Processor (IBM + NVDA):")
-  (println "  30 - 500K trades  (250K each)")
-  (println "  31 - 1M trades    (500K each)")
-  (println "  32 - 100M trades  (50M each) ★★★ ULTIMATE ★★★"))
+  (println help-text))
 
-(defn run!
-  "Run a scenario by number."
-  [conn scenario-num]
-  (if-let [{:keys [fn]} (get scenarios scenario-num)]
-    (fn conn)
-    (do
-      (println (format "Unknown scenario: %d" scenario-num))
-      (list-scenarios)
-      false)))
+;; =============================================================================
+;; Main Entry Point
+;; =============================================================================
+
+(def ^:private welcome
+  "
+╔════════════════════════════════════════════════════════════╗
+║         MATCHING ENGINE CLIENT                             ║
+║                                                            ║
+║  Type (help) for commands, (start!) to connect             ║
+╚════════════════════════════════════════════════════════════╝
+")
+
+(defn -main
+  "Main entry point - starts REPL with client loaded."
+  [& args]
+  (println welcome)
+  (when (seq args)
+    (let [host (first args)
+          port (if (second args) (Integer/parseInt (second args)) 1234)]
+      (start! host port)))
+  ;; Keep running for jar execution
+  (when-not (System/getProperty "clojure.main.report")
+    (while true
+      (Thread/sleep 10000))))
