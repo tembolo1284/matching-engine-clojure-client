@@ -5,6 +5,12 @@
   (:gen-class))
 
 ;; =============================================================================
+;; Constants
+;; =============================================================================
+
+(def ^:const PRICE-MULTIPLIER 1000)  ; 3 decimal places
+
+;; =============================================================================
 ;; State
 ;; =============================================================================
 
@@ -128,27 +134,45 @@
     (println "Not connected")))
 
 ;; =============================================================================
+;; Price Helpers
+;; =============================================================================
+
+(defn- to-wire-price
+  "Convert decimal price to wire format (integer with multiplier)."
+  [price]
+  (long (Math/round (* (double price) PRICE-MULTIPLIER))))
+
+(defn- format-price-display
+  "Format price for display (3 decimal places)."
+  [price]
+  (format "%.3f" (double price)))
+
+;; =============================================================================
 ;; Order Commands
 ;; =============================================================================
 
 (defn buy
-  "Send a buy order."
+  "Send a buy order. Price supports decimals (e.g., 100.55)."
   [symbol price qty]
   (when-let [conn (:conn @state)]
     (let [oid (next-order-id!)
-          user-id (:user-id @state)]
-      (println (format "Sent BUY %s %d @ %.2f (order #%d)" symbol qty (double price) oid))
-      (client/send-order! conn user-id symbol (int price) qty :buy oid)
+          user-id (:user-id @state)
+          wire-price (to-wire-price price)]
+      (println (format "Sent BUY %s %d @ %s (order #%d)" 
+                       symbol qty (format-price-display price) oid))
+      (client/send-order! conn user-id symbol wire-price qty :buy oid)
       oid)))
 
 (defn sell
-  "Send a sell order."
+  "Send a sell order. Price supports decimals (e.g., 100.55)."
   [symbol price qty]
   (when-let [conn (:conn @state)]
     (let [oid (next-order-id!)
-          user-id (:user-id @state)]
-      (println (format "Sent SELL %s %d @ %.2f (order #%d)" symbol qty (double price) oid))
-      (client/send-order! conn user-id symbol (int price) qty :sell oid)
+          user-id (:user-id @state)
+          wire-price (to-wire-price price)]
+      (println (format "Sent SELL %s %d @ %s (order #%d)" 
+                       symbol qty (format-price-display price) oid))
+      (client/send-order! conn user-id symbol wire-price qty :sell oid)
       oid)))
 
 (defn cancel
@@ -276,7 +300,7 @@
         sent (atom 0)]
     
     (dotimes [i count]
-      (let [price (+ 100 (mod i 100))
+      (let [price (* (+ 100 (mod i 100)) PRICE-MULTIPLIER)  ; Use wire price
             oid (next-order-id!)]
         (client/send-order! conn user-id "IBM" price 10 :buy oid)
         (swap! sent inc))
@@ -324,7 +348,7 @@
         pairs-sent (atom 0)]
     
     (dotimes [i pairs]
-      (let [price (+ 100 (mod i 50))
+      (let [price (* (+ 100 (mod i 50)) PRICE-MULTIPLIER)  ; Use wire price
             buy-oid (next-order-id!)
             sell-oid (next-order-id!)]
         (client/send-order! conn user-id "IBM" price 10 :buy buy-oid)
@@ -388,7 +412,7 @@
       
       (dotimes [i pairs]
         (let [symbol (nth symbols (mod i 2))
-              price (+ 100 (mod i 50))
+              price (* (+ 100 (mod i 50)) PRICE-MULTIPLIER)  ; Use wire price
               buy-oid (next-order-id!)
               sell-oid (next-order-id!)]
           (client/send-order! conn user-id symbol price 10 :buy buy-oid)
