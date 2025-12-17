@@ -18,8 +18,7 @@
    :ws-port        8080
    :ws-host        "0.0.0.0"
    :serve-static   true
-   :message-filter #{:trade :order-ack :order-reject 
-                     :cancel-ack :cancel-reject :top-of-book}
+   :message-filter #{:trade :ack :reject :cancel-ack :cancel-reject :top-of-book}
    :log-level      :info})
 
 ;; =============================================================================
@@ -108,7 +107,7 @@
     [(assoc args :serve-static false) 1]
     
     ("--all")
-    [(assoc args :message-filter #{:trade :order-ack :order-reject 
+    [(assoc args :message-filter #{:trade :ack :reject 
                                    :cancel-ack :cancel-reject :top-of-book}) 1]
     
     ("-v" "--verbose")
@@ -167,7 +166,7 @@ USAGE:
 
 OPTIONS:
   -e, --engine HOST:PORT    Engine TCP address (default: localhost:1234)
-  -m, --multicast GROUP:PORT  Multicast group (e.g., 239.255.1.1:1236)
+  -m, --multicast GROUP:PORT  Multicast group (e.g., 239.255.0.1:1236)
   -t, --transport TYPE      Transport: tcp, udp, multicast (default: tcp)
   -i, --interface IFACE     Network interface for multicast
   -w, --ws-port PORT        WebSocket server port (default: 8080)
@@ -183,10 +182,10 @@ EXAMPLES:
   clojure -M:relay -e localhost:1234 -w 8080
 
   # Multicast market data feed
-  clojure -M:relay -m 239.255.1.1:1236 -w 8080
+  clojure -M:relay -m 239.255.0.1:1236 -w 8080
 
   # Both (TCP for orders, multicast for data)
-  clojure -M:relay -m 239.255.1.1:1236 -w 8080")
+  clojure -M:relay -m 239.255.0.1:1236 -w 8080")
 
 (defn print-help []
   (println help-text))
