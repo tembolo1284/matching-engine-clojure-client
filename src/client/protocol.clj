@@ -31,6 +31,9 @@
 
 (def ^:const SYMBOL-SIZE 8)
 
+;; Price multiplier (3 decimal places)
+(def ^:const PRICE-MULTIPLIER 1000.0)
+
 ;; =============================================================================
 ;; Symbol Encoding
 ;; =============================================================================
@@ -303,13 +306,19 @@
     (csv-decode-output-bytes data)))
 
 ;; =============================================================================
-;; Message Formatting (for REPL display)
+;; Price Formatting
 ;; =============================================================================
 
 (defn format-price
-  "Format price as string."
-  [price]
-  (str price))
+  "Format wire price to display string (divide by multiplier)."
+  [wire-price]
+  (if (or (nil? wire-price) (zero? wire-price))
+    "-"
+    (format "%.3f" (/ (double wire-price) PRICE-MULTIPLIER))))
+
+;; =============================================================================
+;; Message Formatting (for REPL display)
+;; =============================================================================
 
 (defn format-message
   "Format a decoded message for human-readable display."

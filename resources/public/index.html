@@ -112,10 +112,15 @@
         .buy { color: var(--accent-green); }
         .sell { color: var(--accent-red); }
         .time { color: var(--text-muted); font-size: 0.8rem; }
+        .price { font-family: 'SF Mono', monospace; }
+        .qty { text-align: right; }
+        .filled-qty { color: var(--accent-purple); }
         
         .status-badge { display: inline-block; padding: 2px 8px; border-radius: 4px;
                         font-size: 0.75rem; font-weight: 500; text-transform: uppercase; }
         .status-badge.ack { background: rgba(46, 204, 113, 0.15); color: var(--accent-green); }
+        .status-badge.open { background: rgba(46, 204, 113, 0.15); color: var(--accent-green); }
+        .status-badge.partial { background: rgba(243, 156, 18, 0.15); color: var(--accent-yellow); }
         .status-badge.cancelled { background: rgba(231, 76, 60, 0.15); color: var(--accent-red); }
         .status-badge.filled { background: rgba(155, 89, 182, 0.15); color: var(--accent-purple); }
         
@@ -168,8 +173,8 @@
                     </div>
                 </div>
                 <table>
-                    <thead><tr><th>Order ID</th><th>User</th><th>Symbol</th><th>Status</th><th>Time</th></tr></thead>
-                    <tbody id="orders-body"><tr><td colspan="5" class="empty">No orders yet</td></tr></tbody>
+                    <thead><tr><th>Order ID</th><th>User</th><th>Symbol</th><th>Filled</th><th>Status</th><th>Time</th></tr></thead>
+                    <tbody id="orders-body"><tr><td colspan="6" class="empty">No orders yet</td></tr></tbody>
                 </table>
             </div>
             
@@ -197,6 +202,14 @@
     </div>
 
     <script>
+        // Price multiplier (must match server)
+        const PRICE_MULTIPLIER = 1000.0;
+        
+        function formatPrice(wirePrice) {
+            if (wirePrice == null || wirePrice === 0) return '-';
+            return (wirePrice / PRICE_MULTIPLIER).toFixed(3);
+        }
+
         const state = {
             orders: new Map(),
             trades: [],
@@ -274,7 +287,18 @@
             const oid = get(msg, 'orderId', 'order-id', 'order_id');
             const uid = get(msg, 'userId', 'user-id', 'user_id');
             const sym = get(msg, 'symbol');
-            state.orders.set(`${uid}-${oid}`, { oid, uid, sym, status: 'ACK', time: new Date() });
+            
+            const key = `${uid}-${oid}`;
+            const existing = state.orders.get(key);
+            
+            state.orders.set(key, { 
+                oid, 
+                uid, 
+                sym, 
+                filledQty: existing ? existing.filledQty : 0,
+                status: 'OPEN', 
+                time: new Date() 
+            });
             addLog('ack', `ACK ${sym} user=${uid} order=${oid}`);
             updateOrders();
         }
@@ -292,12 +316,22 @@
             state.trades.unshift({ sym, price, qty, buid, boid, suid, soid, time: new Date() });
             if (state.trades.length > 100) state.trades.pop();
             
-            // Update order statuses
+            // Update order fill quantities and status
             [`${buid}-${boid}`, `${suid}-${soid}`].forEach(k => {
-                if (state.orders.has(k)) state.orders.get(k).status = 'FILLED';
+                if (state.orders.has(k)) {
+                    const order = state.orders.get(k);
+                    const prevFilled = order.filledQty || 0;
+                    order.filledQty = prevFilled + qty;
+                    
+                    // Mark as PARTIAL for now; will be FILLED when order leaves book
+                    // Since we don't know original qty, use PARTIAL for any fill
+                    if (order.status === 'OPEN') {
+                        order.status = 'PARTIAL';
+                    }
+                }
             });
             
-            addLog('trade', `TRADE ${sym} ${qty}@${price}`);
+            addLog('trade', `TRADE ${sym} ${qty}@${formatPrice(price)}`);
             updateOrders();
             updateTrades();
         }
@@ -308,7 +342,16 @@
             const uid = get(msg, 'userId', 'user-id');
             const sym = get(msg, 'symbol');
             const k = `${uid}-${oid}`;
-            if (state.orders.has(k)) state.orders.get(k).status = 'CANCELLED';
+            if (state.orders.has(k)) {
+                const order = state.orders.get(k);
+                // If it had fills, mark as FILLED (fully executed portion cancelled)
+                // Otherwise mark as CANCELLED
+                if (order.filledQty > 0) {
+                    order.status = 'FILLED';
+                } else {
+                    order.status = 'CANCELLED';
+                }
+            }
             addLog('cancel', `CANCEL ${sym} user=${uid} order=${oid}`);
             updateOrders();
         }
@@ -327,7 +370,7 @@
             const price = get(msg, 'price');
             const qty = get(msg, 'quantity', 'qty');
             const sideStr = side === 'buy' ? 'BID' : 'ASK';
-            addLog('book', price === 0 && qty === 0 ? `BOOK ${sym} ${sideStr} EMPTY` : `BOOK ${sym} ${sideStr} ${qty}@${price}`);
+            addLog('book', price === 0 && qty === 0 ? `BOOK ${sym} ${sideStr} EMPTY` : `BOOK ${sym} ${sideStr} ${qty}@${formatPrice(price)}`);
         }
 
         function addLog(type, msg) {
@@ -350,11 +393,12 @@
                 .sort((a, b) => b.time - a.time).slice(0, 100);
             
             const tbody = document.getElementById('orders-body');
-            tbody.innerHTML = orders.length === 0 ? '<tr><td colspan="5" class="empty">No orders yet</td></tr>' :
+            tbody.innerHTML = orders.length === 0 ? '<tr><td colspan="6" class="empty">No orders yet</td></tr>' :
                 orders.map(o => `<tr>
                     <td>${o.oid}</td>
                     <td>${o.uid}</td>
                     <td class="symbol">${o.sym}</td>
+                    <td class="qty filled-qty">${o.filledQty || 0}</td>
                     <td><span class="status-badge ${o.status.toLowerCase()}">${o.status}</span></td>
                     <td class="time">${o.time.toLocaleTimeString()}</td>
                 </tr>`).join('');
@@ -365,8 +409,8 @@
             tbody.innerHTML = state.trades.length === 0 ? '<tr><td colspan="6" class="empty">No trades yet</td></tr>' :
                 state.trades.slice(0, 50).map(t => `<tr>
                     <td class="symbol">${t.sym}</td>
-                    <td>${t.price}</td>
-                    <td>${t.qty}</td>
+                    <td class="price">${formatPrice(t.price)}</td>
+                    <td class="qty">${t.qty}</td>
                     <td class="buy">${t.buid}/${t.boid}</td>
                     <td class="sell">${t.suid}/${t.soid}</td>
                     <td class="time">${t.time.toLocaleTimeString()}</td>
